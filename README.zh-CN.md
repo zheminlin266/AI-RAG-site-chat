@@ -20,6 +20,8 @@
 网站右下角出现一个浮动聊天按钮。访客点击后提问，得到的回答基于**你的**内容——你的博客、文档、数据。AI 只知道你给它的东西。
 
 - **RAG（检索增强生成）**：回答扎根于你的文档，拒绝幻觉
+- **混合检索**：语义搜索（向量）+ 关键词匹配（BM25）+ RRF 融合，知识库再大也不漏
+- **智能过滤**：余弦距离阈值自动过滤不相关内容，宁愿说"不知道"也不硬凑
 - **多格式支持**：Markdown、HTML、JSON、纯文本——直接丢进去
 - **API 嵌入**：无需本地下载模型，全部通过 OpenRouter 接口
 - **流式响应**：文字逐字生成，所见即所得
@@ -163,7 +165,21 @@ import { AiChat } from "./components/ai-chat";
 │  │ .json .txt  │   │             │   │ → ChromaDB    │  │
 │  └─────────────┘   └─────────────┘   └───────┬───────┘  │
 │                                              │           │
-│                    用户提问 → Embed API → Top-K 搜索      │
+│           ┌──────────────────────────────────┘           │
+│           │                                              │
+│           ▼                                              │
+│    ┌──────────────┐     ┌─────────────┐                  │
+│    │ 向量搜索     │     │ BM25 关键词 │                  │
+│    │ (语义相似)   │     │ (精确匹配)  │                  │
+│    └──────┬───────┘     └──────┬──────┘                  │
+│           │                    │                          │
+│           └────────┬───────────┘                          │
+│                    ▼                                      │
+│            ┌──────────────┐                               │
+│            │ RRF 融合     │                               │
+│            │ → 距离阈值   │                               │
+│            │ → Top-20     │                               │
+│            └──────────────┘                               │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -172,7 +188,7 @@ import { AiChat } from "./components/ai-chat";
 1. 用户输入问题 → `POST /api/chat`
 2. **来源校验**——仅允许同源请求
 3. **消息清洗**——单条上限 4000 字符，历史最多 20 轮
-4. **RAG 检索**——问题嵌入后从 ChromaDB 取 Top-5 相关片段
+4. **混合检索**——向量搜索（语义）+ BM25（关键词）→ RRF 融合 → 距离阈值过滤 → Top-20
 5. **提示词组装**——人格 + 检索上下文 + 引用规则 + 安全护栏
 6. **LLM 调用**——通过 OpenRouter 流式调用，自动模型切换
 7. **流式响应**——token 逐字推送到前端
@@ -221,6 +237,28 @@ EMBEDDING_MODEL=openai/text-embedding-3-small
 | `google/text-embedding-004` | 768 | $0.0025 | 低成本 |
 | `cohere/embed-multilingual-v3.0` | 1024 | $0.10 | 多语言 |
 
+### 调整检索策略
+
+```bash
+# .env
+# 最终返回给 LLM 的 chunk 数（默认 20）
+RETRIEVAL_K=20
+
+# 向量和 BM25 各自检索的候选数（默认 50）
+RETRIEVAL_CANDIDATE_K=50
+
+# 余弦距离阈值——超过此值的 chunk 视为不相关，直接丢弃（默认 0.5）
+# 越小越严格，设为 1.0 则关闭过滤
+MIN_SIMILARITY=0.5
+```
+
+**检索管线**：
+1. 向量搜索（语义相似）→ 取 CANDIDATE_K 个候选 → 距离阈值过滤
+2. BM25 关键词搜索 → 取 CANDIDATE_K 个候选
+3. Reciprocal Rank Fusion 融合两路排名 → 返回 Top-RETRIEVAL_K
+
+知识库较小时（<100 个 chunk），建议设置 `MIN_SIMILARITY=1.0` 关闭过滤。知识库越大，阈值越重要。
+
 ### 自定义安全护栏
 
 编辑 `backend/persona.py` 中的 `GUARDRAILS` 部分，调整：
@@ -258,6 +296,10 @@ curl -X POST http://localhost:8000/api/rebuild-index
   "status": "ok",
   "has_index": true,
   "chunk_count": 42,
+  "has_bm25": true,
+  "retrieval_k": 20,
+  "candidate_k": 50,
+  "min_similarity": 0.5,
   "models": ["deepseek/deepseek-v4-flash", "google/gemini-2.0-flash-001"]
 }
 ```
@@ -297,36 +339,231 @@ curl -X POST http://localhost:8000/api/rebuild-index
 
 ---
 
-## 部署
+## VPS 部署
 
-### 方式 A：Nginx 反向代理（推荐）
+架构简洁：一个 Docker 容器跑 FastAPI，前面挂一个反向代理提供 HTTPS。没有外部数据库依赖——ChromaDB 用 Docker volume 持久化，索引和缓存都在本地磁盘。
 
-```nginx
-location /api/ {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_buffering off;
-    proxy_cache off;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+```
+Internet ──▶ Nginx/Caddy (HTTPS) ──▶ Docker 容器 (FastAPI:8000)
+```
+
+### 前置条件
+
+- **VPS**：Ubuntu 22.04+ / Debian 12+，1 核 1G 即可（推荐 2G，首次构建索引时嵌入 API 调用较多）
+- **Docker + Docker Compose**：[官方安装指南](https://docs.docker.com/engine/install/)
+- **域名**（推荐）：用于配置 HTTPS 证书
+- **OpenRouter API Key**：[openrouter.ai](https://openrouter.ai/) 注册即送免费额度
+
+### 步骤 1：准备项目
+
+```bash
+git clone https://github.com/your-org/AI-RAG-site-chat.git
+cd AI-RAG-site-chat
+
+# 配置环境变量
+cp .env.example .env
+# 编辑 .env：填入 OPENROUTER_API_KEY
+```
+
+### 步骤 2：放入知识库文档
+
+```bash
+# 把你需要 AI"了解"的文档放进 knowledge-base/
+cp /path/to/your/docs/*.md knowledge-base/
+```
+
+或通过 `.env` 设置 `DATA_DIR` 指向本地文件夹或 GitHub 仓库。
+
+### 步骤 3：选择部署方案
+
+下面对比三种方案，按复杂度递增：
+
+| 方案 | HTTPS | 适合场景 |
+|------|-------|---------|
+| [A. 纯 Docker Compose](#方案-a纯-docker-compose) | 需额外配置 | 已有反向代理 / 仅测试 |
+| [B. Docker + Caddy](#方案-bdocker--caddy推荐最简单-https) | 自动 | **推荐**：个人 VPS，最简单 |
+| [C. Docker + Nginx + Let's Encrypt](#方案-cdocker--nginx--lets-encrypt) | 手动配置 | 已有 Nginx 或需要精细控制 |
+
+---
+
+### 方案 A：纯 Docker Compose
+
+仅启动应用容器，监听 8000 端口。如果你已经有了反向代理或者只是想测试一下。
+
+```bash
+# 启动
+docker compose up -d
+
+# 检查状态
+curl http://localhost:8000/api/health
+# → {"status":"ok","has_index":true,"chunk_count":42,"has_bm25":true,"retrieval_k":20}
+
+# 查看日志
+docker compose logs -f
+```
+
+前端设置 `apiBase="http://your-server-ip:8000"`。如需 HTTPS，往下看。
+
+---
+
+### 方案 B：Docker + Caddy（推荐，最简单 HTTPS）
+
+[Caddy](https://caddyserver.com/) 自动申请和续期 Let's Encrypt 证书，零配置 HTTPS。
+
+**1. 安装 Caddy**
+
+```bash
+# Ubuntu/Debian
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update && sudo apt install caddy
+```
+
+**2. 启动应用**
+
+```bash
+docker compose up -d
+# 应用绑定在 127.0.0.1:8000，外部无法直接访问
+```
+
+**3. 配置 Caddy**
+
+编辑 `/etc/caddy/Caddyfile`：
+
+```caddy
+chat.your-domain.com {
+    reverse_proxy 127.0.0.1:8000
 }
 ```
 
-前端设置 `apiBase="/api"`——同源访问，无 CORS 问题。
-
-### 方式 B：Docker
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
-CMD ["python", "-m", "backend.server"]
+```bash
+sudo systemctl reload caddy
+# 证书自动申请，几秒后 https://chat.your-domain.com 即可访问
 ```
 
-### 方式 C：GitHub Pages + 独立后端
+前端设置 `apiBase="https://chat.your-domain.com"`。Caddy 自动处理 TLS、HTTP→HTTPS 重定向和 WebSocket/SSE 代理，流式响应正常工作。
 
-静态站点托管在 GitHub Pages，后端跑在 $5/月的 VPS 或 [Fly.io](https://fly.io) / [Railway](https://railway.app)。在 `.env` 中设置 `CORS_ORIGIN=https://your-site.github.io`。
+---
+
+### 方案 C：Docker + Nginx + Let's Encrypt
+
+适合已有 Nginx 或需要更精细控制的场景。
+
+**1. 启动应用**
+
+```bash
+docker compose up -d
+```
+
+**2. 安装 Nginx + Certbot**
+
+```bash
+sudo apt install -y nginx certbot python3-certbot-nginx
+```
+
+**3. 配置 Nginx**
+
+创建 `/etc/nginx/sites-available/rag-chat`：
+
+```nginx
+server {
+    listen 80;
+    server_name chat.your-domain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+
+        # SSE 流式响应需要这些
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # 保护重建索引接口
+    location /api/rebuild-index {
+        proxy_pass http://127.0.0.1:8000;
+        # 可选：添加 IP 白名单或 basic auth
+        # allow 你的办公IP;
+        # deny all;
+    }
+}
+```
+
+关键配置说明：
+- `proxy_buffering off` + `proxy_cache off` — SSE 流式响应的必要条件
+- `proxy_http_version 1.1` — 支持 keep-alive 和 chunked transfer
+
+**4. 启用站点 + HTTPS**
+
+```bash
+sudo ln -s /etc/nginx/sites-available/rag-chat /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+
+# 申请证书
+sudo certbot --nginx -d chat.your-domain.com
+
+# 证书每 90 天自动续期
+```
+
+---
+
+### 数据持久化
+
+`docker-compose.yml` 中定义了两个 named volume，容器重启不会丢失数据：
+
+| Volume | 路径 | 内容 |
+|--------|------|------|
+| `chroma_data` | `/app/.chroma_db` | 向量索引（首次启动自动构建） |
+| `github_cache` | `/app/.github_cache` | GitHub 数据源缓存 |
+
+知识库文档通过 bind mount 挂载（`./knowledge-base:/app/knowledge-base:ro`），宿主机直接编辑即可。
+
+### 更新流程
+
+```bash
+# 拉取最新代码
+git pull
+
+# 重新构建并重启
+docker compose up -d --build
+
+# 如果知识库有变更，重建索引
+curl -X POST http://localhost:8000/api/rebuild-index
+```
+
+### 日志与监控
+
+```bash
+# 实时日志
+docker compose logs -f
+
+# 健康检查
+curl https://chat.your-domain.com/api/health
+
+# 系统资源
+docker stats rag-chat
+```
+
+推荐配合 [Uptime Kuma](https://github.com/louislam/uptime-kuma) 监控 `/api/health` 端点，或设置简单的 cron：
+
+```bash
+# crontab -e
+*/5 * * * * curl -fSs https://chat.your-domain.com/api/health || echo "RAG Chat is down" | mail -s "Alert" you@example.com
+```
+
+### 安全建议
+
+- 防火墙仅开放 80/443，**不要**开放 8000
+- `.env` 中设置 `CORS_ORIGIN=https://your-domain.com`
+- 重建索引接口设置 `REBUILD_SECRET` 或用 nginx IP 白名单保护
+- 定期 `docker compose pull` 更新基础镜像（安全补丁）
 
 ---
 
@@ -335,17 +572,21 @@ CMD ["python", "-m", "backend.server"]
 ```
 AI-RAG-site-chat/
 ├── README.md
+├── README.zh-CN.md
 ├── PERSONA.md              # AI 人格设定（编辑这个）
 ├── .env.example            # 配置模板
-├── requirements.txt
+├── requirements.txt        # Python 依赖 (FastAPI, ChromaDB, rank-bm25...)
 ├── package.json
+├── Dockerfile              # 容器镜像
+├── docker-compose.yml      # VPS 一键部署
+├── .dockerignore
 │
 ├── backend/
 │   ├── server.py           # FastAPI 服务（4 个接口）
-│   ├── rag_engine.py       # RAG 管线（加载 → 切片 → 嵌入 → 搜索）
+│   ├── rag_engine.py       # RAG 管线（加载 → 切片 → 嵌入 → 混合检索）
 │   ├── persona.py          # 加载 PERSONA.md，构建系统提示词
 │   ├── chat_util.py        # 来源校验、消息清洗、HTTP 客户端、速率限制
-│   ├── config.py           # 全部通过环境变量配置
+│   ├── config.py           # 全部通过环境变量配置（含检索参数）
 │   ├── github_source.py    # GitHub 仓库文件夹克隆与缓存
 │   └── parsers/
 │       ├── md_loader.py    # Markdown 解析器
@@ -354,7 +595,7 @@ AI-RAG-site-chat/
 │       └── txt_loader.py   # 纯文本解析器
 │
 ├── frontend/
-│   └── ai-chat.tsx         # React 聊天组件（887 行）
+│   └── ai-chat.tsx         # React 聊天组件
 │
 └── knowledge-base/         # 把你的文档放在这里
     └── .gitkeep
@@ -364,7 +605,7 @@ AI-RAG-site-chat/
 
 ## 致谢
 
-灵感来自 [pedromello.cc](https://pedromello.cc) 的 "Ask me anything" 模块。基于 [FastAPI](https://fastapi.tiangolo.com/)、[ChromaDB](https://www.trychroma.com/) 和 [OpenRouter](https://openrouter.ai/)（LLM + 嵌入）构建。
+灵感来自 [pedromello.cc](https://pedromello.cc) 的 "Ask me anything" 模块。基于 [FastAPI](https://fastapi.tiangolo.com/)、[ChromaDB](https://www.trychroma.com/)、[rank-bm25](https://github.com/dorianbrown/rank_bm25) 和 [OpenRouter](https://openrouter.ai/)（LLM + 嵌入）构建。
 
 ---
 

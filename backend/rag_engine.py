@@ -6,7 +6,12 @@ Default: openai/text-embedding-3-small (1536-dim, $0.02/1M tokens).
 
 Data flow:
   Docs → Chunks → OpenRouter Embed API → ChromaDB
-  Query → OpenRouter Embed API → ChromaDB search → Top-K Chunks
+  Query → Hybrid (Vector + BM25 + RRF) → Filtered Top-K Chunks
+
+Retrieval strategy:
+  - Vector search (semantic) + BM25 (keyword) → Reciprocal Rank Fusion
+  - Cosine distance threshold filters out irrelevant chunks
+  - No LLM re-ranking — RRF alone provides sufficient precision
 """
 from __future__ import annotations
 
@@ -17,6 +22,7 @@ from typing import TypedDict
 
 import chromadb
 import httpx
+from rank_bm25 import BM25Okapi
 
 import backend.config as _cfg
 
@@ -54,6 +60,58 @@ def _get_collection() -> chromadb.Collection:
             metadata={"hnsw:space": "cosine"},
         )
     return _collection
+
+
+# ── BM25 索引（单例） ───────────────────────────────
+# ponytail: 全量存储在内存中。O(n) 内存 ≈ chunk 数 × 平均词数。
+# 对于 50K 以下 chunk 没问题；超过 100K 建议换用磁盘 BM25（tantivy）。
+
+_bm25_index: BM25Okapi | None = None
+_bm25_chunk_ids: list[str] = []  # 与 BM25 索引排序一致的 chunk ID 列表
+_all_chunks: dict[str, Chunk] = {}  # chunk_id → Chunk 全量映射（用于 BM25 命中回查）
+
+
+def _tokenize(text: str) -> list[str]:
+    """Simple tokenizer for Chinese + English. No external NLP deps.
+
+    Strategy:
+    - English/numbers: whitespace splitting, lowercased
+    - Chinese: character bigrams for partial matching (standard approach
+      for Chinese BM25 without a segmenter like jieba)
+    - Punctuation stripped
+    """
+    import re
+
+    tokens: list[str] = []
+
+    # Split into Chinese runs vs non-Chinese runs
+    segments = re.split(r"([\u4e00-\u9fff]+)", text)
+    for seg in segments:
+        if not seg.strip():
+            continue
+        if re.match(r"[\u4e00-\u9fff]+", seg):
+            # Chinese: character bigrams for partial match
+            chars = list(seg)
+            for i in range(len(chars)):
+                tokens.append(chars[i])
+                if i < len(chars) - 1:
+                    tokens.append(chars[i] + chars[i + 1])
+        else:
+            # English/numbers: whitespace tokenize, lowercase, strip punct
+            for word in seg.split():
+                cleaned = word.strip(".,;:!?()[]{}'\"-").lower()
+                if cleaned:
+                    tokens.append(cleaned)
+
+    return [t for t in tokens if t.strip()]
+
+
+def _get_bm25() -> BM25Okapi | None:
+    return _bm25_index
+
+
+def _get_bm25_chunk_ids() -> list[str]:
+    return _bm25_chunk_ids
 
 
 # ── 嵌入：通过 OpenRouter API ────────────────────────
@@ -266,7 +324,66 @@ def _make_chunk_id(source: str, heading: str, text: str) -> str:
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 
+# ── Reciprocal Rank Fusion ──────────────────────────
+
+
+def _rrf_fusion(
+    vector_results: list[tuple[str, float]],
+    bm25_results: list[tuple[str, float]],
+    k: int = 60,
+) -> list[str]:
+    """
+    Merge two ranked lists via Reciprocal Rank Fusion.
+
+    score(chunk) = Σ 1 / (k + rank_in_list_i)
+
+    k=60 is the standard value from the original RRF paper.
+    Returns chunk IDs sorted by descending fused score.
+    """
+    scores: dict[str, float] = {}
+
+    for rank, (chunk_id, _score) in enumerate(vector_results):
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+
+    for rank, (chunk_id, _score) in enumerate(bm25_results):
+        scores[chunk_id] = scores.get(chunk_id, 0.0) + 1.0 / (k + rank + 1)
+
+    sorted_pairs = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    return [cid for cid, _ in sorted_pairs]
+
+
 # ── 公共 API ────────────────────────────────────────
+
+
+def _rebuild_bm25_from_collection(collection: chromadb.Collection) -> None:
+    """
+    Rebuild BM25 index from existing ChromaDB collection.
+    Called when index exists but BM25 is not built (restart after upgrade).
+    """
+    global _bm25_index, _bm25_chunk_ids, _all_chunks
+
+    existing = collection.count()
+    if existing == 0:
+        return
+
+    # Fetch all chunks from ChromaDB in batches
+    # ponytail: ChromaDB get() with no filter returns all — fine for <50K chunks
+    all_data = collection.get(include=["documents", "metadatas"])
+    if not all_data["ids"]:
+        return
+
+    ids = all_data["ids"]
+    docs = all_data["documents"] or [""] * len(ids)
+    metas = all_data["metadatas"] or [{}] * len(ids)
+
+    tokenized = [_tokenize(d) for d in docs]
+    _bm25_index = BM25Okapi(tokenized)
+    _bm25_chunk_ids = list(ids)
+    _all_chunks = {
+        cid: Chunk(id=cid, text=t, metadata=m)
+        for cid, t, m in zip(ids, docs, metas)
+    }
+    logger.info(f"BM25 index rebuilt from {len(ids)} existing chunks")
 
 
 def build_index(force: bool = False) -> int:
@@ -274,15 +391,21 @@ def build_index(force: bool = False) -> int:
     Load all documents, chunk, embed via OpenRouter API, store in ChromaDB.
     Returns total chunk count.
     """
+    global _chroma_client, _collection, _bm25_index, _bm25_chunk_ids, _all_chunks
+
     collection = _get_collection()
     existing = collection.count()
     if existing > 0 and not force:
-        logger.info(f"Index has {existing} chunks, skipping rebuild")
+        # Ensure BM25 is built even if index already exists (restart / upgrade path)
+        if _bm25_index is None:
+            logger.info(f"Index has {existing} chunks, building BM25 index...")
+            _rebuild_bm25_from_collection(collection)
+        else:
+            logger.info(f"Index has {existing} chunks, skipping rebuild")
         return existing
 
     if existing > 0:
         logger.info(f"Rebuilding: clearing {existing} existing chunks...")
-        global _chroma_client, _collection
         _chroma_client.delete_collection("knowledge")
         _collection = None
         _collection = _chroma_client.get_or_create_collection(
@@ -334,39 +457,105 @@ def build_index(force: bool = False) -> int:
     )
 
     logger.info(f"Index built: {len(dedup_ids)} chunks")
+
+    # ── 同步构建 BM25 索引 ──
+    tokenized = [_tokenize(t) for t in dedup_texts]
+    _bm25_index = BM25Okapi(tokenized)
+    _bm25_chunk_ids = dedup_ids[:]
+    _all_chunks = {cid: Chunk(id=cid, text=t, metadata=m)
+                   for cid, t, m in zip(dedup_ids, dedup_texts, dedup_metas)}
+    logger.info(f"BM25 index built: {len(dedup_ids)} documents")
+
     return len(dedup_ids)
 
 
 def search(query: str, k: int = _cfg.RETRIEVAL_K) -> list[Chunk]:
-    """Retrieve top-K relevant chunks via OpenRouter embedding + ChromaDB search."""
+    """
+    Hybrid retrieval: vector (semantic) + BM25 (keyword) → RRF fusion.
+
+    1. Vector search → K candidates with cosine distances
+    2. BM25 keyword search → K candidates
+    3. Distance threshold: drop vector results with distance > MIN_SIMILARITY
+    4. RRF merge both ranked lists
+    5. Return top-K chunks (or empty list if nothing relevant found)
+    """
+    candidate_k = _cfg.RETRIEVAL_CANDIDATE_K
+    min_sim = _cfg.MIN_SIMILARITY
+
+    # ── Vector search ──
     collection = _get_collection()
     if collection.count() == 0:
         return []
 
     query_embedding = _embed([query])
-
     results = collection.query(
         query_embeddings=query_embedding,  # type: ignore[arg-type]
-        n_results=k,
+        n_results=candidate_k,
         include=["documents", "metadatas", "distances"],
     )
 
-    chunks: list[Chunk] = []
-    if results["ids"] and results["ids"][0]:
-        for i, chunk_id in enumerate(results["ids"][0]):
-            chunks.append(Chunk(
-                id=chunk_id,
-                text=results["documents"][0][i] if results["documents"] else "",
-                metadata=results["metadatas"][0][i] if results["metadatas"] else {},
-            ))
+    if not results["ids"] or not results["ids"][0]:
+        return []
 
-    return chunks
+    vector_chunks: dict[str, Chunk] = {}
+    vector_ranked: list[tuple[str, float]] = []  # (chunk_id, distance)
+
+    for i, chunk_id in enumerate(results["ids"][0]):
+        dist = results["distances"][0][i] if results["distances"] else 0.0
+        text = results["documents"][0][i] if results["documents"] else ""
+        meta = results["metadatas"][0][i] if results["metadatas"] else {}
+
+        # Distance threshold: drop irrelevant chunks
+        if dist > min_sim:
+            continue
+
+        vector_chunks[chunk_id] = Chunk(id=chunk_id, text=text, metadata=meta)
+        # Invert distance for RRF ranking (smaller distance = more relevant = lower rank)
+        vector_ranked.append((chunk_id, dist))
+
+    # ── BM25 keyword search ──
+    bm25 = _get_bm25()
+    bm25_ids = _get_bm25_chunk_ids()
+    bm25_ranked: list[tuple[str, float]] = []
+
+    if bm25 is not None and bm25_ids:
+        tokenized_query = _tokenize(query)
+        scores = bm25.get_scores(tokenized_query)
+
+        # Build (chunk_id, score) pairs and sort by score descending
+        scored = [(bm25_ids[i], float(scores[i])) for i in range(len(bm25_ids))]
+        scored.sort(key=lambda x: x[1], reverse=True)
+        bm25_ranked = scored[:candidate_k]
+
+    # ── RRF fusion ──
+    fused_ids = _rrf_fusion(vector_ranked, bm25_ranked)
+
+    if not fused_ids:
+        return []
+
+    # ── Collect results, preferring vector chunks for text/metadata ──
+    result_chunks: list[Chunk] = []
+    for cid in fused_ids[:k]:
+        if cid in vector_chunks:
+            result_chunks.append(vector_chunks[cid])
+        elif cid in _all_chunks:
+            result_chunks.append(_all_chunks[cid])
+        else:
+            # Should not happen in normal operation
+            logger.warning(f"Chunk {cid} not found in vector_chunks or _all_chunks")
+
+    return result_chunks
 
 
 def get_index_stats() -> dict:
     collection = _get_collection()
+    bm25 = _get_bm25()
     return {
         "chunk_count": collection.count(),
         "knowledge_base_dir": str(_cfg.KNOWLEDGE_BASE_DIR),
         "has_index": collection.count() > 0,
+        "has_bm25": bm25 is not None,
+        "retrieval_k": _cfg.RETRIEVAL_K,
+        "candidate_k": _cfg.RETRIEVAL_CANDIDATE_K,
+        "min_similarity": _cfg.MIN_SIMILARITY,
     }

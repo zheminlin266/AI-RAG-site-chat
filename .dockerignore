@@ -1,0 +1,44 @@
+# ── Git ──
+.git
+.gitignore
+.github
+
+# ── Python ──
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+env
+.env
+*.egg-info
+*.egg
+.pytest_cache
+.mypy_cache
+
+# ── Node ──
+node_modules
+
+# ── IDE ──
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# ── OS ──
+.DS_Store
+Thumbs.db
+
+# ── Runtime data (built at container start) ──
+.chroma_db
+.github_cache
+
+# ── Docker ──
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# ── Misc ──
+*.md
+LICENSE

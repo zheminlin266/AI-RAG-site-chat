@@ -20,6 +20,8 @@
 A floating chat button appears on your website. Visitors click it, ask questions, and get answers grounded in **your** content — your blog posts, your docs, your data. The AI only knows what you give it.
 
 - RAG (Retrieval-Augmented Generation): answers are grounded in your documents, not hallucinated
+- Hybrid search: semantic (vector) + keyword (BM25) → RRF fusion — scales to large knowledge bases
+- Smart filtering: cosine distance threshold drops irrelevant chunks — honest "I don't know" over forced answers
 - Multi-format: Markdown, HTML, JSON, plain text — drop anything in
 - API-based embeddings: no local model download — everything goes through OpenRouter
 - Streaming responses: words appear as they're generated
@@ -165,7 +167,22 @@ Or embed as a vanilla script (see [frontend/README.md](./frontend/README.md) for
 │  │ .json .txt  │   │ by headings │   │ → ChromaDB    │  │
 │  └─────────────┘   └─────────────┘   └───────┬───────┘  │
 │                                              │           │
-│                          Query → embed API → search Top-K │
+│           ┌──────────────────────────────────┘           │
+│           │                                              │
+│           ▼                                              │
+│    ┌──────────────┐     ┌──────────────┐                 │
+│    │ Vector search│     │ BM25 keyword │                 │
+│    │ (semantic)   │     │ (exact match)│                 │
+│    └──────┬───────┘     └──────┬───────┘                 │
+│           │                    │                          │
+│           └────────┬───────────┘                          │
+│                    ▼                                      │
+│            ┌──────────────┐                               │
+│            │ RRF fusion   │                               │
+│            │ → distance   │                               │
+│            │   threshold  │                               │
+│            │ → Top-20     │                               │
+│            └──────────────┘                               │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -174,7 +191,7 @@ Or embed as a vanilla script (see [frontend/README.md](./frontend/README.md) for
 1. User types a question → `POST /api/chat`
 2. **Origin check** — only same-origin requests allowed
 3. **Message sanitization** — max 4000 chars, max 20 history rounds
-4. **RAG retrieval** — query embedded, Top-5 chunks from ChromaDB
+4. **Hybrid retrieval** — vector (semantic) + BM25 (keyword) → RRF fusion → distance threshold → Top-20
 5. **Prompt assembly** — Persona + retrieved context + citing rules + guardrails
 6. **LLM call** — streaming via OpenRouter, automatic model fallback
 7. **Streaming response** — tokens flow to frontend as they're generated
@@ -223,6 +240,28 @@ EMBEDDING_MODEL=openai/text-embedding-3-small
 | `google/text-embedding-004` | 768 | $0.0025 | Budget |
 | `cohere/embed-multilingual-v3.0` | 1024 | $0.10 | Multilingual |
 
+### Tune retrieval
+
+```bash
+# .env
+# Final chunk count sent to LLM (default 20)
+RETRIEVAL_K=20
+
+# Candidate pool size for vector and BM25 searches (default 50)
+RETRIEVAL_CANDIDATE_K=50
+
+# Cosine distance threshold — chunks above this are dropped as irrelevant (default 0.5)
+# Lower = stricter filter. Set to 1.0 to disable filtering.
+MIN_SIMILARITY=0.5
+```
+
+**Retrieval pipeline**:
+1. Vector search (semantic) → CANDIDATE_K candidates → distance threshold filter
+2. BM25 keyword search → CANDIDATE_K candidates
+3. Reciprocal Rank Fusion merges both rankings → Top-RETRIEVAL_K
+
+For small knowledge bases (<100 chunks), set `MIN_SIMILARITY=1.0` to disable filtering. Larger collections benefit from a tighter threshold.
+
 ### Customize guardrails
 
 Edit `backend/persona.py` → `GUARDRAILS` section to adjust:
@@ -260,6 +299,10 @@ When `DATA_DIR` points to a GitHub URL like `https://github.com/user/repo/tree/m
   "status": "ok",
   "has_index": true,
   "chunk_count": 42,
+  "has_bm25": true,
+  "retrieval_k": 20,
+  "candidate_k": 50,
+  "min_similarity": 0.5,
   "models": ["deepseek/deepseek-v4-flash", "google/gemini-2.0-flash-001"]
 }
 ```
@@ -299,36 +342,229 @@ Rebuilds the knowledge base index. Returns: `{ "status": "ok", "chunk_count": 42
 
 ---
 
-## Deployment
+## VPS Deployment
 
-### Option A: Behind nginx (recommended)
+The architecture is simple: one Docker container running FastAPI, with a reverse proxy in front for HTTPS. No external database dependencies — ChromaDB persists to a Docker volume, and both the index and cache live on local disk.
 
-```nginx
-location /api/ {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_buffering off;
-    proxy_cache off;
-    proxy_set_header Host $host;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+```
+Internet ──▶ Nginx/Caddy (HTTPS) ──▶ Docker container (FastAPI:8000)
+```
+
+### Prerequisites
+
+- **VPS**: Ubuntu 22.04+ / Debian 12+, 1 vCPU 1 GB RAM minimum (2 GB recommended — the initial index build makes many embedding API calls)
+- **Docker + Docker Compose**: [official install guide](https://docs.docker.com/engine/install/)
+- **Domain name** (recommended): for HTTPS certificates
+- **OpenRouter API Key**: sign up at [openrouter.ai](https://openrouter.ai/) for free credits
+
+### Step 1: Get the project
+
+```bash
+git clone https://github.com/your-org/AI-RAG-site-chat.git
+cd AI-RAG-site-chat
+
+# Configure environment
+cp .env.example .env
+# Edit .env — paste your OPENROUTER_API_KEY
+```
+
+### Step 2: Add your knowledge base
+
+```bash
+# Drop your documents into knowledge-base/
+cp /path/to/your/docs/*.md knowledge-base/
+```
+
+Or set `DATA_DIR` in `.env` to point to a local folder or GitHub repo.
+
+### Step 3: Pick a deployment option
+
+| Option | HTTPS | Best for |
+|--------|-------|----------|
+| [A. Plain Docker Compose](#option-a-plain-docker-compose) | Extra setup needed | Already have a reverse proxy / testing |
+| [B. Docker + Caddy](#option-b-docker--caddy-recommended-simplest-https) | Automatic | **Recommended**: personal VPS, dead simple |
+| [C. Docker + Nginx + Let's Encrypt](#option-c-docker--nginx--lets-encrypt) | Manual setup | Already running Nginx or need fine-grained control |
+
+---
+
+### Option A: Plain Docker Compose
+
+Just the app container on port 8000. Good if you already have a reverse proxy or just want to test.
+
+```bash
+# Start
+docker compose up -d
+
+# Verify
+curl http://localhost:8000/api/health
+# → {"status":"ok","has_index":true,"chunk_count":42,"has_bm25":true,"retrieval_k":20}
+
+# Logs
+docker compose logs -f
+```
+
+Point your frontend at `apiBase="http://your-server-ip:8000"`. For HTTPS, keep reading.
+
+---
+
+### Option B: Docker + Caddy (Recommended, simplest HTTPS)
+
+[Caddy](https://caddyserver.com/) auto-provisions and renews Let's Encrypt certificates — zero config HTTPS.
+
+**1. Install Caddy**
+
+```bash
+# Ubuntu/Debian
+sudo apt install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | sudo gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | sudo tee /etc/apt/sources.list.d/caddy-stable.list
+sudo apt update && sudo apt install caddy
+```
+
+**2. Start the app**
+
+```bash
+docker compose up -d
+# App bound to 127.0.0.1:8000 — not reachable externally
+```
+
+**3. Configure Caddy**
+
+Edit `/etc/caddy/Caddyfile`:
+
+```caddy
+chat.your-domain.com {
+    reverse_proxy 127.0.0.1:8000
 }
 ```
 
-Then point `apiBase="/api"` in the frontend — no CORS issues, same origin.
-
-### Option B: Docker
-
-```dockerfile
-FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-COPY . .
-CMD ["python", "-m", "backend.server"]
+```bash
+sudo systemctl reload caddy
+# Certificate auto-provisioned — visit https://chat.your-domain.com
 ```
 
-### Option C: GitHub Pages + separate backend
+Point your frontend at `apiBase="https://chat.your-domain.com"`. Caddy handles TLS, HTTP→HTTPS redirect, and SSE/streaming out of the box.
 
-Host your static site on GitHub Pages, run the backend on a $5 VPS or [Fly.io](https://fly.io) / [Railway](https://railway.app). Set `CORS_ORIGIN=https://your-site.github.io` in `.env`.
+---
+
+### Option C: Docker + Nginx + Let's Encrypt
+
+For existing Nginx setups or when you need fine-grained control.
+
+**1. Start the app**
+
+```bash
+docker compose up -d
+```
+
+**2. Install Nginx + Certbot**
+
+```bash
+sudo apt install -y nginx certbot python3-certbot-nginx
+```
+
+**3. Configure Nginx**
+
+Create `/etc/nginx/sites-available/rag-chat`:
+
+```nginx
+server {
+    listen 80;
+    server_name chat.your-domain.com;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+
+        # Required for SSE streaming
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Protect the rebuild-index endpoint
+    location /api/rebuild-index {
+        proxy_pass http://127.0.0.1:8000;
+        # Optional: IP whitelist or basic auth
+        # allow your-office-ip;
+        # deny all;
+    }
+}
+```
+
+Key settings:
+- `proxy_buffering off` + `proxy_cache off` — essential for SSE streaming
+- `proxy_http_version 1.1` — enables keep-alive and chunked transfer
+
+**4. Enable site + HTTPS**
+
+```bash
+sudo ln -s /etc/nginx/sites-available/rag-chat /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+
+# Get a certificate
+sudo certbot --nginx -d chat.your-domain.com
+
+# Auto-renews every 90 days
+```
+
+---
+
+### Data persistence
+
+`docker-compose.yml` defines two named volumes — data survives container restarts and rebuilds:
+
+| Volume | Mount path | What it stores |
+|--------|-----------|----------------|
+| `chroma_data` | `/app/.chroma_db` | Vector index (built on first start) |
+| `github_cache` | `/app/.github_cache` | GitHub data source cache |
+
+Knowledge base files are bind-mounted (`./knowledge-base:/app/knowledge-base:ro`) — edit them directly on the host.
+
+### Updating
+
+```bash
+# Pull latest code
+git pull
+
+# Rebuild and restart
+docker compose up -d --build
+
+# If knowledge base has changed, rebuild index
+curl -X POST http://localhost:8000/api/rebuild-index
+```
+
+### Logs & monitoring
+
+```bash
+# Live logs
+docker compose logs -f
+
+# Health check
+curl https://chat.your-domain.com/api/health
+
+# Resource usage
+docker stats rag-chat
+```
+
+Pair with [Uptime Kuma](https://github.com/louislam/uptime-kuma) to monitor the `/api/health` endpoint, or add a simple cron:
+
+```bash
+# crontab -e
+*/5 * * * * curl -fSs https://chat.your-domain.com/api/health || echo "RAG Chat down" | mail -s "Alert" you@example.com
+```
+
+### Security checklist
+
+- Firewall: only open ports 80/443, **never** expose 8000
+- Set `CORS_ORIGIN=https://your-domain.com` in `.env`
+- Protect `/api/rebuild-index` with `REBUILD_SECRET` or nginx IP whitelist
+- `docker compose pull` periodically to update base images (security patches)
 
 ---
 
@@ -337,17 +573,21 @@ Host your static site on GitHub Pages, run the backend on a $5 VPS or [Fly.io](h
 ```
 AI-RAG-site-chat/
 ├── README.md
+├── README.zh-CN.md
 ├── PERSONA.md              # Your AI persona (edit this)
 ├── .env.example            # Config template
-├── requirements.txt
+├── requirements.txt        # Python deps (FastAPI, ChromaDB, rank-bm25...)
 ├── package.json
+├── Dockerfile              # Container image
+├── docker-compose.yml      # VPS one-command deploy
+├── .dockerignore
 │
 ├── backend/
 │   ├── server.py           # FastAPI server (4 endpoints)
-│   ├── rag_engine.py       # RAG pipeline (load → chunk → embed → search)
+│   ├── rag_engine.py       # RAG pipeline (load → chunk → embed → hybrid search)
 │   ├── persona.py          # Loads PERSONA.md + builds system prompt
 │   ├── chat_util.py        # Origin check, sanitize, HTTP client, rate limiter
-│   ├── config.py           # All config via env vars
+│   ├── config.py           # All config via env vars (incl. retrieval params)
 │   ├── github_source.py    # GitHub repo folder clone & cache
 │   └── parsers/
 │       ├── md_loader.py    # Markdown parser
@@ -356,7 +596,7 @@ AI-RAG-site-chat/
 │       └── txt_loader.py   # Plain text parser
 │
 ├── frontend/
-│   └── ai-chat.tsx         # React chat widget (887 lines)
+│   └── ai-chat.tsx         # React chat widget
 │
 └── knowledge-base/         # Your documents go here
     └── .gitkeep
@@ -366,7 +606,7 @@ AI-RAG-site-chat/
 
 ## Acknowledgments
 
-Inspired by [pedromello.cc](https://pedromello.cc)'s "Ask me anything" module. Built with [FastAPI](https://fastapi.tiangolo.com/), [ChromaDB](https://www.trychroma.com/), and [OpenRouter](https://openrouter.ai/) (LLM + embeddings).
+Inspired by [pedromello.cc](https://pedromello.cc)'s "Ask me anything" module. Built with [FastAPI](https://fastapi.tiangolo.com/), [ChromaDB](https://www.trychroma.com/), [rank-bm25](https://github.com/dorianbrown/rank_bm25), and [OpenRouter](https://openrouter.ai/) (LLM + embeddings).
 
 ---
 

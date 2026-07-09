@@ -1,0 +1,46 @@
+services:
+  rag-chat:
+    # Use pre-built image from GitHub Container Registry:
+    # image: ghcr.io/your-org/rag-site-chat:latest
+    # Or build from source (default):
+    build: .
+    restart: unless-stopped
+
+    # Bind to localhost only — put nginx/Caddy in front for HTTPS.
+    # Remove "127.0.0.1:" to expose directly (not recommended without TLS).
+    ports:
+      - "127.0.0.1:${PORT:-8000}:${PORT:-8000}"
+
+    env_file:
+      - .env
+
+    volumes:
+      # ChromaDB index — persists across restarts
+      - chroma_data:/app/.chroma_db
+
+      # GitHub sparse-checkout cache
+      - github_cache:/app/.github_cache
+
+      # Knowledge base documents (read-only for safety)
+      - ./knowledge-base:/app/knowledge-base:ro
+
+      # Bind-mount PERSONA.md for live editing without rebuild
+      # Remove this line if you only edit PERSONA.md at build time
+      - ./PERSONA.md:/app/PERSONA.md:ro
+
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "from urllib.request import urlopen; urlopen('http://localhost:${PORT:-8000}/api/health')",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  chroma_data:
+  github_cache:

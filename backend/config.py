@@ -53,7 +53,14 @@ CHROMA_DB_DIR = BASE_DIR / ".chroma_db"
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))
-RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "5"))
+
+# 检索参数
+# RETRIEVAL_K: 最终返回给 LLM 的 chunk 数
+# CANDIDATE_K: 向量/BM25 各自检索的候选数（应 >= RETRIEVAL_K）
+# MIN_SIMILARITY: 余弦距离阈值（越小越相似），超过此值的 chunk 视为不相关
+RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "20"))
+RETRIEVAL_CANDIDATE_K = int(os.getenv("RETRIEVAL_CANDIDATE_K", "50"))
+MIN_SIMILARITY = float(os.getenv("MIN_SIMILARITY", "0.5"))
 
 # ── LLM ────────────────────────────────────────────
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")

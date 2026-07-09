@@ -9,7 +9,8 @@ __pycache__/
 venv/
 
 # ChromaDB 向量索引（每次启动自动重建）
-knowledge-base/.chroma_db/
+.chroma_db/
+.github_cache/
 
 # 编辑器
 .vscode/

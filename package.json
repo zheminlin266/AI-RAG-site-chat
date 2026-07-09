@@ -1,0 +1,23 @@
+{
+  "name": "rag-site-chat",
+  "version": "1.0.0",
+  "description": "RAG-powered AI chat widget for any static website — plug in your docs, write your persona, add your API key.",
+  "license": "MIT",
+  "keywords": [
+    "rag",
+    "ai-chat",
+    "chatbot",
+    "fastapi",
+    "chromadb",
+    "openrouter",
+    "site-widget"
+  ],
+  "dependencies": {
+    "framer-motion": "^11.0.0",
+    "react": "^18.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0",
+    "@types/react": "^18.0.0"
+  }
+}

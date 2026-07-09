@@ -6,8 +6,17 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-# ── 路径 ───────────────────────────────────────────
+from dotenv import load_dotenv
+
+# ── 加载 .env ──────────────────────────────────────
 BASE_DIR = Path(__file__).resolve().parent.parent
+_dotenv_path = BASE_DIR / ".env"
+if _dotenv_path.exists():
+    load_dotenv(_dotenv_path)
+else:
+    load_dotenv()  # fallback: search cwd
+
+# ── 路径 ───────────────────────────────────────────
 PERSONA_FILE = Path(os.getenv("PERSONA_FILE", str(BASE_DIR / "PERSONA.md")))
 
 # GitHub 仓库缓存目录
@@ -38,7 +47,10 @@ else:
 CHROMA_DB_DIR = BASE_DIR / ".chroma_db"
 
 # ── RAG ────────────────────────────────────────────
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+# 嵌入模型 — 通过 OpenRouter API（无需本地下载）
+# openai/text-embedding-3-small: 1536维, $0.02/1M tokens
+# 备选: google/text-embedding-004, cohere/embed-multilingual-v3.0
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "openai/text-embedding-3-small")
 CHUNK_SIZE = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))
 RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "5"))
@@ -47,7 +59,7 @@ RETRIEVAL_K = int(os.getenv("RETRIEVAL_K", "5"))
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 DEFAULT_MODELS = [
-    "anthropic/claude-sonnet-4.6",
+    "deepseek/deepseek-v4-flash",
     "google/gemini-2.0-flash-001",
 ]
 

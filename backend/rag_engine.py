@@ -1,11 +1,12 @@
 """
-RAG 引擎 — 多格式文档加载、分块、向量化、检索。
+RAG engine — multi-format document loading, chunking, embedding, retrieval.
 
-数据流:
-  knowledge-base/*.{md,html,json,txt} → Chunks → Embeddings → ChromaDB
-  用户 query → Embedding → ChromaDB.search → Top-K Chunks
+Embeddings via OpenRouter API (no local model download needed).
+Default: openai/text-embedding-3-small (1536-dim, $0.02/1M tokens).
 
-支持格式: Markdown、HTML、JSON、纯文本
+Data flow:
+  Docs → Chunks → OpenRouter Embed API → ChromaDB
+  Query → OpenRouter Embed API → ChromaDB search → Top-K Chunks
 """
 from __future__ import annotations
 
@@ -15,13 +16,10 @@ from pathlib import Path
 from typing import TypedDict
 
 import chromadb
-from sentence_transformers import SentenceTransformer
+import httpx
 
 import backend.config as _cfg
 
-# 延迟取值：knowledge base dir 可能在运行时被 server.py 的 lifespan 覆盖
-# (e.g. GitHub URL → sparse clone → 替换路径)
-# 因此不能 from backend.config import KNOWLEDGE_BASE_DIR 做本地拷贝
 from backend.parsers import (
     load_markdown_files,
     load_html_files,
@@ -38,22 +36,6 @@ class Chunk(TypedDict):
     id: str
     text: str
     metadata: dict[str, str]
-
-
-# ── 嵌入模型（单例） ────────────────────────────────
-
-_embedding_model: SentenceTransformer | None = None
-
-
-def get_embedding_model() -> SentenceTransformer:
-    global _embedding_model
-    if _embedding_model is None:
-        logger.info(f"Loading embedding model: {_cfg.EMBEDDING_MODEL}")
-        _embedding_model = SentenceTransformer(_cfg.EMBEDDING_MODEL)
-        logger.info(
-            f"Model loaded: dim={_embedding_model.get_sentence_embedding_dimension()}"
-        )
-    return _embedding_model
 
 
 # ── ChromaDB（单例） ────────────────────────────────
@@ -74,14 +56,73 @@ def _get_collection() -> chromadb.Collection:
     return _collection
 
 
-# ── 多格式文档加载 ──────────────────────────────────
+# ── 嵌入：通过 OpenRouter API ────────────────────────
+
+
+def _embed(texts: list[str], model: str | None = None) -> list[list[float]]:
+    """
+    Get embeddings via OpenRouter API.
+
+    ponytail: single HTTP call, no retry. For batch indexing,
+    chunks are sent in sub-batches to avoid timeout/memory issues.
+    API: https://openrouter.ai/docs/features/embeddings
+    """
+    if not texts:
+        return []
+
+    api_key = _cfg.OPENROUTER_API_KEY
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set — cannot generate embeddings")
+
+    embedding_model = model or _cfg.EMBEDDING_MODEL
+    client = httpx.Client(timeout=120.0)
+
+    try:
+        resp = client.post(
+            "https://openrouter.ai/api/v1/embeddings",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={"model": embedding_model, "input": texts},
+        )
+        if resp.status_code != 200:
+            raise RuntimeError(
+                f"Embedding API returned {resp.status_code}: {resp.text[:500]}"
+            )
+
+        data = resp.json()
+        # Sort by index to preserve input order
+        sorted_data = sorted(data["data"], key=lambda d: d["index"])
+        return [d["embedding"] for d in sorted_data]
+
+    finally:
+        client.close()
+
+
+def _embed_in_batches(
+    texts: list[str],
+    batch_size: int = 50,
+    model: str | None = None,
+) -> list[list[float]]:
+    """
+    Generate embeddings in batches to avoid API timeouts.
+    Returns embeddings in the same order as input texts.
+    """
+    all_embeddings: list[list[float]] = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i : i + batch_size]
+        logger.info(f"  Embedding batch {i // batch_size + 1}: {len(batch)} texts...")
+        embeddings = _embed(batch, model=model)
+        all_embeddings.extend(embeddings)
+    return all_embeddings
+
+
+# ── 文档加载 ────────────────────────────────────────
 
 
 def _load_all_documents(directory: Path) -> list[dict]:
-    """
-    Load all supported document types from a directory.
-    Dispatches to format-specific parsers.
-    """
+    """Load all supported document types."""
     all_files: list[dict] = []
 
     loaders: list[tuple[str, callable]] = [
@@ -111,13 +152,7 @@ def _split_into_chunks(
     chunk_size: int = _cfg.CHUNK_SIZE,
     overlap: int = _cfg.CHUNK_OVERLAP,
 ) -> list[Chunk]:
-    """
-    Split text into chunks by headings, then sentences for long sections.
-
-    ponytail: simple char-based token estimation instead of tiktoken.
-    English ~4 char/token, Chinese ~1.5 char/token.
-    Accurate enough for chunk sizing at knowledge-base scale.
-    """
+    """Split text into chunks by headings, then sentences for long sections."""
     chunks: list[Chunk] = []
     sections = _split_by_headings(text)
 
@@ -139,7 +174,6 @@ def _split_into_chunks(
 
 
 def _split_by_headings(text: str) -> list[tuple[str, str]]:
-    """Split text by ## / # headings."""
     import re
     pattern = r"^#{1,3}\s+.+$"
     lines = text.split("\n")
@@ -172,7 +206,6 @@ def _split_by_headings(text: str) -> list[tuple[str, str]]:
 def _split_long_section(
     heading: str, text: str, source: str, chunk_size: int, overlap: int
 ) -> list[Chunk]:
-    """Split long sections by sentences with overlap."""
     import re
     sentences = re.split(r"(?<=[。！？.!?\n])\s*", text)
     sentences = [s.strip() for s in sentences if s.strip()]
@@ -228,7 +261,8 @@ def _estimate_tokens(text: str) -> int:
 
 
 def _make_chunk_id(source: str, heading: str, text: str) -> str:
-    raw = f"{source}|{heading}|{text[:200]}"
+    """Generate stable chunk ID from content hash. Uses full text to avoid collisions."""
+    raw = f"{source}|{heading}|{text}"
     return hashlib.md5(raw.encode()).hexdigest()[:16]
 
 
@@ -237,9 +271,8 @@ def _make_chunk_id(source: str, heading: str, text: str) -> str:
 
 def build_index(force: bool = False) -> int:
     """
-    Load all documents, chunk, embed, store in ChromaDB.
+    Load all documents, chunk, embed via OpenRouter API, store in ChromaDB.
     Returns total chunk count.
-    Skips if index exists and force=False.
     """
     collection = _get_collection()
     existing = collection.count()
@@ -272,33 +305,45 @@ def build_index(force: bool = False) -> int:
     if not all_chunks:
         return 0
 
-    model = get_embedding_model()
     texts = [c["text"] for c in all_chunks]
     ids = [c["id"] for c in all_chunks]
     metadatas = [c["metadata"] for c in all_chunks]
 
-    logger.info(f"Generating embeddings for {len(texts)} chunks...")
-    embeddings = model.encode(texts, show_progress_bar=False).tolist()
+    # 去重：相同内容的 chunk 只保留一份
+    seen: set[str] = set()
+    dedup_ids, dedup_texts, dedup_metas = [], [], []
+    for cid, ct, cm in zip(ids, texts, metadatas):
+        if cid not in seen:
+            seen.add(cid)
+            dedup_ids.append(cid)
+            dedup_texts.append(ct)
+            dedup_metas.append(cm)
+
+    dup_count = len(texts) - len(dedup_ids)
+    if dup_count:
+        logger.info(f"Removed {dup_count} duplicate chunks")
+
+    logger.info(f"Generating embeddings for {len(dedup_texts)} chunks via OpenRouter...")
+    embeddings = _embed_in_batches(dedup_texts, batch_size=50)
 
     collection.add(
-        ids=ids,
+        ids=dedup_ids,
         embeddings=embeddings,  # type: ignore[arg-type]
-        documents=texts,
-        metadatas=metadatas,  # type: ignore[arg-type]
+        documents=dedup_texts,
+        metadatas=dedup_metas,  # type: ignore[arg-type]
     )
 
-    logger.info(f"Index built: {len(all_chunks)} chunks")
-    return len(all_chunks)
+    logger.info(f"Index built: {len(dedup_ids)} chunks")
+    return len(dedup_ids)
 
 
 def search(query: str, k: int = _cfg.RETRIEVAL_K) -> list[Chunk]:
-    """Retrieve top-K relevant chunks for a query."""
+    """Retrieve top-K relevant chunks via OpenRouter embedding + ChromaDB search."""
     collection = _get_collection()
     if collection.count() == 0:
         return []
 
-    model = get_embedding_model()
-    query_embedding = model.encode([query], show_progress_bar=False).tolist()
+    query_embedding = _embed([query])
 
     results = collection.query(
         query_embeddings=query_embedding,  # type: ignore[arg-type]

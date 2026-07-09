@@ -20,6 +20,7 @@ A floating chat button appears on your website. Visitors click it, ask questions
 
 - RAG (Retrieval-Augmented Generation): answers are grounded in your documents, not hallucinated
 - Multi-format: Markdown, HTML, JSON, plain text — drop anything in
+- API-based embeddings: no local model download — everything goes through OpenRouter
 - Streaming responses: words appear as they're generated
 - Model fallback: if one LLM fails, it tries the next automatically
 - Follow-up suggestions: keeps the conversation going
@@ -158,12 +159,12 @@ Or embed as a vanilla script (see [frontend/README.md](./frontend/README.md) for
 │                                                           │
 │  Data sources: Local folder │ GitHub repo │ knowledge-base/ │
 │  ┌─────────────┐   ┌─────────────┐   ┌───────────────┐  │
-│  │ Doc Loader  │──▶│ Chunk       │──▶│ Embed + Store │  │
-│  │ .md .html   │   │ Splitter    │   │ (ChromaDB)    │  │
-│  │ .json .txt  │   │ by headings │   │ cosine sim    │  │
+│  │ Doc Loader  │──▶│ Chunk       │──▶│ OpenRouter    │  │
+│  │ .md .html   │   │ Splitter    │   │ Embed API     │  │
+│  │ .json .txt  │   │ by headings │   │ → ChromaDB    │  │
 │  └─────────────┘   └─────────────┘   └───────┬───────┘  │
 │                                              │           │
-│                          Query → embed → search → Top-K │
+│                          Query → embed API → search Top-K │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -200,27 +201,26 @@ The AI **cannot** access the internet, training data, or anything outside your k
 
 ```bash
 # .env
-OPENROUTER_MODEL=anthropic/claude-sonnet-4.6,openai/gpt-4o-mini
+OPENROUTER_MODEL=deepseek/deepseek-v4-flash,google/gemini-2.0-flash-001
 ```
 
-Default fallback chain: Claude Sonnet → Gemini Flash. Any OpenRouter model works.
+Default: DeepSeek V4 Flash → Gemini Flash fallback. Any [OpenRouter model](https://openrouter.ai/models) works.
 
 ### Change the embedding model
 
-For Chinese-heavy content, switch to a multilingual model:
+Embeddings go through OpenRouter API — no local model download needed. Default is `openai/text-embedding-3-small` (1536-dim, $0.02/1M tokens).
+
+To switch, set in `.env`:
 
 ```bash
-# .env
-EMBEDDING_MODEL=BAAI/bge-m3
+EMBEDDING_MODEL=openai/text-embedding-3-small
 ```
 
-Default: `all-MiniLM-L6-v2` (384-dim, English-optimized, ~80MB). Recommended alternatives:
-
-| Model | Dimensions | Size | Best for |
-|-------|-----------|------|----------|
-| `all-MiniLM-L6-v2` | 384 | ~80MB | English (default) |
-| `BAAI/bge-m3` | 1024 | ~2.2GB | Multilingual (Chinese + English) |
-| `intfloat/multilingual-e5-large` | 1024 | ~2.2GB | Multilingual (100+ languages) |
+| Model | Dimensions | Cost/1M tokens | Best for |
+|-------|-----------|----------------|----------|
+| `openai/text-embedding-3-small` | 1536 | $0.02 | General (default) |
+| `google/text-embedding-004` | 768 | $0.0025 | Budget |
+| `cohere/embed-multilingual-v3.0` | 1024 | $0.10 | Multilingual |
 
 ### Customize guardrails
 
@@ -259,7 +259,7 @@ When `DATA_DIR` points to a GitHub URL like `https://github.com/user/repo/tree/m
   "status": "ok",
   "has_index": true,
   "chunk_count": 42,
-  "models": ["anthropic/claude-sonnet-4.6", "google/gemini-2.0-flash-001"]
+  "models": ["deepseek/deepseek-v4-flash", "google/gemini-2.0-flash-001"]
 }
 ```
 
@@ -365,7 +365,7 @@ AI-RAG-site-chat/
 
 ## Acknowledgments
 
-Inspired by [pedromello.cc](https://pedromello.cc)'s "Ask me anything" module. Built with [FastAPI](https://fastapi.tiangolo.com/), [ChromaDB](https://www.trychroma.com/), [sentence-transformers](https://www.sbert.net/), and [OpenRouter](https://openrouter.ai/).
+Inspired by [pedromello.cc](https://pedromello.cc)'s "Ask me anything" module. Built with [FastAPI](https://fastapi.tiangolo.com/), [ChromaDB](https://www.trychroma.com/), and [OpenRouter](https://openrouter.ai/) (LLM + embeddings).
 
 ---
 

@@ -4,10 +4,9 @@
 
 **RAG-powered AI chat widget for any static website.** Drop in your documents, write a persona, add your API key — your site visitors can chat with your content in under 5 minutes.
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-
 <p align="center">
+  <img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT">
   <img src="https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi" alt="FastAPI">
   <img src="https://img.shields.io/badge/vector_db-ChromaDB-FF6F00" alt="ChromaDB">
   <img src="https://img.shields.io/badge/llm-OpenRouter-6366f1" alt="OpenRouter">

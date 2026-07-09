@@ -2,10 +2,9 @@
 
 **基于 RAG 的 AI 聊天组件，适用于任意静态网站。** 放入你的文档，编写人格设定，填入你的 API Key——网站访客即可在 5 分钟内与你的内容对话。
 
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)
-[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-
 <p align="center">
+  <img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT">
   <img src="https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi" alt="FastAPI">
   <img src="https://img.shields.io/badge/vector_db-ChromaDB-FF6F00" alt="ChromaDB">
   <img src="https://img.shields.io/badge/llm-OpenRouter-6366f1" alt="OpenRouter">

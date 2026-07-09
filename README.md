@@ -1,5 +1,7 @@
 # RAG Site Chat
 
+[中文版](./README.zh-CN.md)
+
 **RAG-powered AI chat widget for any static website.** Drop in your documents, write a persona, add your API key — your site visitors can chat with your content in under 5 minutes.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/)

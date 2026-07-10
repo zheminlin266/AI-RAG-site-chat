@@ -19,7 +19,7 @@
 
 A floating chat button appears on your website. Visitors click it, ask questions, and get answers grounded in **your** content — your blog posts, your docs, your data. The AI only knows what you give it.
 
-![UI Wireframe](UI wireframe.png)
+![UI Wireframe](ui-wireframe.png)
 
 - RAG (Retrieval-Augmented Generation): answers are grounded in your documents, not hallucinated
 - Hybrid search: semantic (vector) + keyword (BM25) → RRF fusion — scales to large knowledge bases

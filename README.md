@@ -2,7 +2,7 @@
 
 [中文Readme](./README.zh-CN.md)
 
-**RAG-powered AI chat widget for any static website.** Drop in your documents, write a persona, add your API key — your site visitors can chat with your content in under 5 minutes.
+**RAG-powered AI chat for websites.** Use the React component in a React app, or copy the zero-dependency `<ai-rag-chat>` Web Component into any static site.
 
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+">
@@ -10,27 +10,27 @@
   <img src="https://img.shields.io/badge/backend-FastAPI-009688?logo=fastapi" alt="FastAPI">
   <img src="https://img.shields.io/badge/vector_db-ChromaDB-FF6F00" alt="ChromaDB">
   <img src="https://img.shields.io/badge/llm-OpenRouter-6366f1" alt="OpenRouter">
-  <img src="https://img.shields.io/badge/frontend-React_18-61DAFB?logo=react" alt="React">
+  <img src="https://img.shields.io/badge/frontend-React_%2B_Web_Component-61DAFB" alt="React and Web Component">
 </p>
 
 ---
 
 ## What it does
 
-A floating chat button appears on your website. Visitors click it, ask questions, and get answers grounded in **your** content — your blog posts, your docs, your data. The AI only knows what you give it.
+A floating chat button appears on your website. Visitors click it, ask questions, and get answers grounded in **your** content — your blog posts, your docs, your data. Retrieval and guardrails make that content the intended source of facts.
 
 ![UI Wireframe](ui-wireframe.png)
 
 - RAG (Retrieval-Augmented Generation): answers are grounded in your documents, not hallucinated
-- Hybrid search: semantic (vector) + keyword (BM25) → RRF fusion — scales to large knowledge bases
-- Smart filtering: cosine distance threshold drops irrelevant chunks — honest "I don't know" over forced answers
+- Hybrid search: semantic (vector) + keyword (BM25) → RRF fusion
+- Smart filtering: vector distance and positive BM25 scores keep irrelevant chunks out
 - Multi-format: Markdown, HTML, JSON, plain text — drop anything in
 - API-based embeddings: no local model download — everything goes through OpenRouter
 - Streaming responses: words appear as they're generated
-- Model fallback: if one LLM fails, it tries the next automatically
+- Default model: DeepSeek V4 Flash; optional fallback models are explicitly configured
 - Follow-up suggestions: keeps the conversation going
-- Same-origin protection: only your site can call the API
-- GitHub data sources: point to any public repo folder — auto clone & sync
+- Exact Origin allowlist, request-size cap, rate limits, and a disabled-by-default rebuild endpoint
+- GitHub data sources: point to a public repo folder — sparse clone and explicit sync on rebuild
 
 ---
 
@@ -39,7 +39,7 @@ A floating chat button appears on your website. Visitors click it, ask questions
 ### 1. Clone and install
 
 ```bash
-git clone https://github.com/your-org/AI-RAG-site-chat.git
+git clone https://github.com/zheminlin266/AI-RAG-site-chat.git
 cd AI-RAG-site-chat
 pip install -r requirements.txt
 ```
@@ -105,9 +105,9 @@ python -m backend.server
 # Index built automatically on first start
 ```
 
-### 6. Add the widget to your site
+### 6a. Add the React component
 
-Drop `<AiChat />` into your React/Next.js app:
+Copy [frontend/ai-chat.tsx](./frontend/ai-chat.tsx) into a React 18+ app that already uses Tailwind CSS and Framer Motion, then render `<AiChat />`:
 
 ```tsx
 import { AiChat } from "./components/ai-chat";
@@ -121,7 +121,21 @@ import { AiChat } from "./components/ai-chat";
 />
 ```
 
-Or embed as a vanilla script (see [frontend/README.md](./frontend/README.md) for details).
+### 6b. Add the standalone Web Component to any static site
+
+Copy `frontend/standalone/ai-rag-chat.js` to your site's static assets, then add:
+
+```html
+<script src="/assets/ai-rag-chat.js" defer></script>
+<ai-rag-chat
+  api-base="https://chat.example.com"
+  label="Ask me anything"
+  language="en"
+  storage="local"
+></ai-rag-chat>
+```
+
+The bundle has no React, Tailwind, or runtime dependency. For a cross-origin backend, set `CORS_ORIGIN=https://your-site.example` on the backend to the exact origin hosting this element.
 
 ---
 
@@ -144,7 +158,7 @@ Or embed as a vanilla script (see [frontend/README.md](./frontend/README.md) for
 │             server.py (FastAPI)                           │
 │                                                           │
 │  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐     │
-│  │ Origin   │  │ Sanitize │  │ Stream Response (SSE) │   │
+│  │ Origin   │  │ Validate │  │ Stream Response       │   │
 │  │ Check    │  │ Messages │  │                       │   │
 │  └──────────┘  └──────────┘  └──────────────────────┘     │
 │        │              │               │                   │
@@ -191,8 +205,8 @@ Or embed as a vanilla script (see [frontend/README.md](./frontend/README.md) for
 ### Data flow (per request)
 
 1. User types a question → `POST /api/chat`
-2. **Origin check** — only same-origin requests allowed
-3. **Message sanitization** — max 4000 chars, max 20 history rounds
+2. **Origin check** — same-origin by default, or an exact configured Origin allowlist
+3. **Request validation** — JSON body capped at 5 MiB; each message is capped at 4000 chars and history at 20 turns
 4. **Hybrid retrieval** — vector (semantic) + BM25 (keyword) → RRF fusion → distance threshold → Top-20
 5. **Prompt assembly** — Persona + retrieved context + citing rules + guardrails
 6. **LLM call** — streaming via OpenRouter, automatic model fallback
@@ -205,13 +219,13 @@ Or embed as a vanilla script (see [frontend/README.md](./frontend/README.md) for
 
 | Layer | Measure |
 |-------|---------|
-| **Transport** | Origin header validation — only your domain can call the API |
-| **Input** | Message type validation, 4000-char cap, 20-round history limit |
-| **Model** | Guardrails prompt prevents jailbreaking, hallucination, out-of-scope answers |
+| **Browser access** | Exact Origin allowlist; empty `CORS_ORIGIN` permits same-origin browser requests only |
+| **Input** | JSON shape validation, 5 MiB request cap, 4000-character message cap, 20-turn history limit |
+| **Model** | Guardrails reduce prompt-injection and out-of-scope behavior; they are not a security boundary |
 | **Deployment** | API key stored server-side only (`OPENROUTER_API_KEY` in `.env`), never exposed to frontend |
-| **CORS** | Configurable `CORS_ORIGIN` — restrict to your domain in production |
+| **Rebuild** | `/api/rebuild-index` is hidden until `REBUILD_SECRET` is configured, then requires its header |
 
-The AI **cannot** access the internet, training data, or anything outside your knowledge base. It only knows what you give it.
+The application does not give the model browsing tools. It instructs the model to ground answers in retrieved content, but an LLM's pretraining cannot be treated as inaccessible or as a hard security boundary.
 
 ---
 
@@ -220,11 +234,12 @@ The AI **cannot** access the internet, training data, or anything outside your k
 ### Change the AI model
 
 ```bash
-# .env
-OPENROUTER_MODEL=deepseek/deepseek-v4-flash,google/gemini-2.0-flash-001
+# Default: deepseek/deepseek-v4-flash
+# Optional, explicit fallback list:
+OPENROUTER_MODEL=deepseek/deepseek-v4-flash,google/gemini-2.5-flash
 ```
 
-Default: DeepSeek V4 Flash → Gemini Flash fallback. Any [OpenRouter model](https://openrouter.ai/models) works.
+Default: DeepSeek V4 Flash only. You may set a comma-separated fallback list, but validate each slug against the current [OpenRouter model catalog](https://openrouter.ai/models) before deploying.
 
 ### Change the embedding model
 
@@ -276,18 +291,19 @@ Edit `backend/persona.py` → `GUARDRAILS` section to adjust:
 
 ```bash
 # After adding/modifying files, rebuild the index:
-curl -X POST http://localhost:8000/api/rebuild-index
+curl -X POST http://localhost:8000/api/rebuild-index \
+  -H "x-rebuild-secret: $REBUILD_SECRET"
 ```
 
-No restart needed. With GitHub sources, rebuild also runs `git pull` to fetch the latest content.
+Set `REBUILD_SECRET` first; without it the endpoint intentionally returns 404. No restart is needed. With GitHub sources, rebuild synchronizes the configured sparse checkout before building a new index, and keeps the prior index live if the new build fails.
 
 ### GitHub source internals
 
 When `DATA_DIR` points to a GitHub URL like `https://github.com/user/repo/tree/main/docs`:
 
 1. **Sparse clone**: `git clone --depth 1 --filter=blob:none --sparse` — fetches only metadata and the target folder, not the entire repo history
-2. **Local cache**: stored in `.github_cache/{owner}_{repo}/`, reused across restarts
-3. **Auto-pull**: on rebuild, runs `git pull --ff-only` to get latest changes
+2. **Local cache**: the configured repository/ref/path is cached and reused across restarts
+3. **Auto-pull**: rebuild runs `git pull --ff-only` and refreshes sparse checkout state
 4. **Requires**: `git` installed on the server (standard on most systems)
 
 ---
@@ -302,10 +318,11 @@ When `DATA_DIR` points to a GitHub URL like `https://github.com/user/repo/tree/m
   "has_index": true,
   "chunk_count": 42,
   "has_bm25": true,
+  "active_collection": "knowledge-staging-…",
   "retrieval_k": 20,
   "candidate_k": 50,
   "min_similarity": 0.5,
-  "models": ["deepseek/deepseek-v4-flash", "google/gemini-2.0-flash-001"]
+  "models": ["deepseek/deepseek-v4-flash"]
 }
 ```
 
@@ -321,7 +338,7 @@ Request:
 }
 ```
 
-Response: `text/plain` streaming, one token per chunk.
+Response: a streamed `text/plain` body. The `X-RAG-Sources` response header contains up to three retrieved source labels as JSON.
 
 ### `POST /api/suggest`
 
@@ -340,7 +357,7 @@ Response:
 
 ### `POST /api/rebuild-index`
 
-Rebuilds the knowledge base index. Returns: `{ "status": "ok", "chunk_count": 42 }`
+Rebuilds the knowledge base index. It is available only when `REBUILD_SECRET` is configured and sent as `x-rebuild-secret`; a failed rebuild retains the active index. Returns: `{ "status": "ok", "chunk_count": 42 }`.
 
 ---
 
@@ -362,7 +379,7 @@ Internet ──▶ Nginx/Caddy (HTTPS) ──▶ Docker container (FastAPI:8000)
 ### Step 1: Get the project
 
 ```bash
-git clone https://github.com/your-org/AI-RAG-site-chat.git
+git clone https://github.com/zheminlin266/AI-RAG-site-chat.git
 cd AI-RAG-site-chat
 
 # Configure environment
@@ -445,7 +462,7 @@ sudo systemctl reload caddy
 # Certificate auto-provisioned — visit https://chat.your-domain.com
 ```
 
-Point your frontend at `apiBase="https://chat.your-domain.com"`. Caddy handles TLS, HTTP→HTTPS redirect, and SSE/streaming out of the box.
+Point your frontend at `apiBase="https://chat.your-domain.com"`. Caddy handles TLS, HTTP→HTTPS redirect, and streamed HTTP responses out of the box.
 
 ---
 
@@ -473,19 +490,20 @@ Create `/etc/nginx/sites-available/rag-chat`:
 server {
     listen 80;
     server_name chat.your-domain.com;
+    client_max_body_size 5m;
 
     location / {
         proxy_pass http://127.0.0.1:8000;
         proxy_http_version 1.1;
 
-        # Required for SSE streaming
+        # Required for unbuffered streamed responses
         proxy_buffering off;
         proxy_cache off;
         chunked_transfer_encoding on;
 
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For $remote_addr;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
@@ -500,7 +518,7 @@ server {
 ```
 
 Key settings:
-- `proxy_buffering off` + `proxy_cache off` — essential for SSE streaming
+- `proxy_buffering off` + `proxy_cache off` — essential for streamed responses
 - `proxy_http_version 1.1` — enables keep-alive and chunked transfer
 
 **4. Enable site + HTTPS**
@@ -538,7 +556,8 @@ git pull
 docker compose up -d --build
 
 # If knowledge base has changed, rebuild index
-curl -X POST http://localhost:8000/api/rebuild-index
+curl -X POST http://localhost:8000/api/rebuild-index \
+  -H "x-rebuild-secret: $REBUILD_SECRET"
 ```
 
 ### Logs & monitoring
@@ -565,7 +584,8 @@ Pair with [Uptime Kuma](https://github.com/louislam/uptime-kuma) to monitor the 
 
 - Firewall: only open ports 80/443, **never** expose 8000
 - Set `CORS_ORIGIN=https://your-domain.com` in `.env`
-- Protect `/api/rebuild-index` with `REBUILD_SECRET` or nginx IP whitelist
+- Set `TRUSTED_PROXY_IPS` only to direct, known reverse proxies; otherwise forwarded IP/protocol headers are ignored
+- Set `REBUILD_SECRET`; the rebuild route stays hidden without it, and can also be IP-restricted in nginx
 - `docker compose pull` periodically to update base images (security patches)
 
 ---
@@ -576,6 +596,7 @@ Pair with [Uptime Kuma](https://github.com/louislam/uptime-kuma) to monitor the 
 AI-RAG-site-chat/
 ├── README.md
 ├── README.zh-CN.md
+├── LICENSE
 ├── PERSONA.md              # Your AI persona (edit this)
 ├── .env.example            # Config template
 ├── requirements.txt        # Python deps (FastAPI, ChromaDB, rank-bm25...)
@@ -598,7 +619,10 @@ AI-RAG-site-chat/
 │       └── txt_loader.py   # Plain text parser
 │
 ├── frontend/
-│   └── ai-chat.tsx         # React chat widget
+│   ├── README.md           # React and static-site integration guide
+│   ├── ai-chat.tsx         # React chat widget
+│   └── standalone/
+│       └── ai-rag-chat.js  # Zero-dependency Web Component bundle
 │
 └── knowledge-base/         # Your documents go here
     └── .gitkeep
@@ -614,4 +638,4 @@ Inspired by [pedromello.cc](https://pedromello.cc)'s "Ask me anything" module. B
 
 ## License
 
-MIT — use it, fork it, ship it.
+[MIT](./LICENSE) — use it, fork it, ship it.

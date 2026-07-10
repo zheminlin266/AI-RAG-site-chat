@@ -1,29 +1,18 @@
-"""
-RAG Site Chat — FastAPI server.
-
-Endpoints:
-  POST /api/chat        — Streaming chat with RAG retrieval
-  POST /api/suggest     — Follow-up question suggestions
-  GET  /api/health      — Health check + index status
-  POST /api/rebuild-index — Force rebuild knowledge index
-
-Start:
-  python -m backend.server
-  uvicorn backend.server:app --host 0.0.0.0 --port 8000
-"""
+"""FastAPI endpoints for retrieval-augmented, streaming site chat."""
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+import secrets
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
 
-import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
+import backend.config as cfg
 from backend.chat_util import (
     ChatMessage,
     check_rate_limit,
@@ -31,15 +20,13 @@ from backend.chat_util import (
     get_openrouter_client,
     is_allowed_origin,
     sanitize,
-    sanitize_output,
-    session_id_of,
     validate_last_user,
 )
 from backend.config import (
-    CORS_ORIGIN,
+    CORS_ORIGINS,
     GITHUB_CACHE_DIR,
-    KNOWLEDGE_BASE_DIR,
     MAX_CONCURRENT_LLM,
+    MAX_REQUEST_BODY_BYTES,
     MAX_TOKENS,
     OPENROUTER_API_KEY,
     PORT,
@@ -54,6 +41,7 @@ from backend.config import (
     ensure_dirs,
     models,
 )
+from backend.github_source import clone_or_pull, is_github_url
 from backend.persona import (
     SUGGEST_SYSTEM,
     build_suggest_prompt,
@@ -62,7 +50,6 @@ from backend.persona import (
 )
 from backend.rag_engine import build_index, get_index_stats, search
 
-# ── 日志 ────────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,132 +57,171 @@ logging.basicConfig(
 )
 logger = logging.getLogger("rag_site_chat")
 
-# ── 并发控制 ────────────────────────────────────────
-
 _llm_semaphore = asyncio.Semaphore(MAX_CONCURRENT_LLM)
+_rebuild_lock = asyncio.Lock()
 
-# ── 启动/关闭 ───────────────────────────────────────
+
+async def _refresh_github_source() -> None:
+    """Refresh a configured GitHub source before a startup build or rebuild."""
+    if not RAW_DATA_DIR or not is_github_url(RAW_DATA_DIR):
+        return
+
+    GITHUB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    resolved = await asyncio.to_thread(clone_or_pull, RAW_DATA_DIR, GITHUB_CACHE_DIR)
+    cfg.KNOWLEDGE_BASE_DIR = resolved
+    logger.info("GitHub source resolved to: %s", resolved)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_dirs()
-
-    # 处理 GitHub 数据源
-    from backend.github_source import clone_or_pull, is_github_url
-    import backend.config as cfg
-
-    if RAW_DATA_DIR and is_github_url(RAW_DATA_DIR):
-        logger.info(f"GitHub data source detected: {RAW_DATA_DIR}")
-        GITHUB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        try:
-            resolved = clone_or_pull(RAW_DATA_DIR, GITHUB_CACHE_DIR)
-            cfg.KNOWLEDGE_BASE_DIR = resolved
-            logger.info(f"GitHub source resolved to: {resolved}")
-        except Exception as e:
-            logger.error(f"GitHub source setup failed: {e}")
-            raise
-
-    logger.info(f"Knowledge base dir: {cfg.KNOWLEDGE_BASE_DIR}")
-    logger.info("Building knowledge base index...")
     try:
-        count = build_index(force=False)
-        logger.info(f"Index ready: {count} chunks")
-    except Exception as e:
-        logger.warning(f"Index build skipped: {e}")
+        await _refresh_github_source()
+    except Exception:
+        logger.exception("GitHub source setup failed")
+        raise
+
+    logger.info("Knowledge base dir: %s", cfg.KNOWLEDGE_BASE_DIR)
+    try:
+        count = await asyncio.to_thread(build_index, force=False)
+        logger.info("Index ready: %s chunks", count)
+    except Exception as error:
+        # The service can still start and report readiness/index status.
+        logger.warning("Index build skipped: %s", error)
     yield
 
 
 app = FastAPI(
     title="RAG Site Chat",
-    description="RAG-powered AI chat module for any static website",
+    description="RAG-powered AI chat module for static websites",
     version="1.0.0",
     lifespan=lifespan,
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=CORS_ORIGIN.split(",") if CORS_ORIGIN != "*" else ["*"],
-    allow_credentials=True,
+    allow_origins=list(CORS_ORIGINS),
+    allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "X-Rebuild-Secret"],
+    expose_headers=["X-RAG-Sources"],
 )
 
 
-# ── 健康检查 ─────────────────────────────────────────
+async def _read_json_object(request: Request) -> dict:
+    """Read at most 5 MiB of JSON without buffering an unbounded request body."""
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            declared_length = int(content_length)
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length") from error
+        if declared_length < 0:
+            raise HTTPException(status_code=400, detail="Invalid Content-Length")
+        if declared_length > MAX_REQUEST_BODY_BYTES:
+            raise HTTPException(status_code=413, detail="Request body must not exceed 5 MiB")
+
+    body = bytearray()
+    try:
+        async for chunk in request.stream():
+            if len(chunk) > MAX_REQUEST_BODY_BYTES - len(body):
+                raise HTTPException(status_code=413, detail="Request body must not exceed 5 MiB")
+            body.extend(chunk)
+    except HTTPException:
+        raise
+    except Exception as error:
+        raise HTTPException(status_code=400, detail="Could not read request body") from error
+
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from error
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+    return payload
 
 
 @app.get("/api/health")
 async def health():
-    stats = get_index_stats()
-    return {
-        "status": "ok",
-        "has_index": stats["has_index"],
-        "chunk_count": stats["chunk_count"],
-    }
+    stats = await asyncio.to_thread(get_index_stats)
+    return {"status": "ok", "models": models(), **stats}
 
 
-# ── 重建索引 ─────────────────────────────────────────
+def _source_header(chunks: list[dict]) -> str:
+    """Return a compact, display-safe list of retrieved source labels."""
+    labels: list[str] = []
+    for chunk in chunks:
+        metadata = chunk.get("metadata", {})
+        if not isinstance(metadata, dict):
+            continue
+        source = metadata.get("source", "")
+        heading = metadata.get("heading", "")
+        if not isinstance(source, str) or not source:
+            continue
+        label = f"{heading} — {source}" if isinstance(heading, str) and heading else source
+        if label not in labels:
+            labels.append(label[:240])
+        if len(labels) == 3:
+            break
+    return json.dumps(labels, ensure_ascii=True, separators=(",", ":"))
 
 
 @app.post("/api/rebuild-index")
 async def rebuild_index(request: Request):
-    # 频率限制
-    check_rate_limit(request, "rebuild", RATE_LIMIT_REBUILD[0], RATE_LIMIT_REBUILD[1])
+    """Safely rebuild the index when explicitly enabled and authenticated."""
+    if not REBUILD_SECRET:
+        # Do not expose an expensive administrative endpoint by default.
+        raise HTTPException(status_code=404, detail="Not found")
+    if not is_allowed_origin(request, require_origin=False):
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-    # 简单密钥保护（生产环境建议用 nginx basic auth）
-    if REBUILD_SECRET:
-        provided = request.headers.get("x-rebuild-secret", "")
-        if provided != REBUILD_SECRET:
-            raise HTTPException(status_code=403, detail="Forbidden")
+    provided_secret = request.headers.get("x-rebuild-secret", "")
+    if not secrets.compare_digest(provided_secret, REBUILD_SECRET):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    check_rate_limit(request, "rebuild", *RATE_LIMIT_REBUILD)
 
-    try:
-        count = build_index(force=True)
-        return {"status": "ok", "chunk_count": count}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    if _rebuild_lock.locked():
+        raise HTTPException(status_code=409, detail="An index rebuild is already in progress")
 
-
-# ── 聊天 ─────────────────────────────────────────────
+    async with _rebuild_lock:
+        try:
+            await _refresh_github_source()
+            count = await asyncio.to_thread(build_index, force=True)
+        except Exception:
+            logger.exception("Index rebuild failed; the active index was retained")
+            raise HTTPException(
+                status_code=503,
+                detail="Index rebuild failed; the existing index is still active.",
+            )
+    return {"status": "ok", "chunk_count": count}
 
 
 @app.post("/api/chat")
 async def chat(request: Request):
-    """
-    Streaming chat endpoint.
-
-    Request: { messages: [{role, content}], sessionId?: string }
-    Response: text/plain stream, one token per chunk.
-    """
+    """Stream a RAG-backed response as plain text."""
     if not is_allowed_origin(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-
-    check_rate_limit(request, "chat", RATE_LIMIT_CHAT[0], RATE_LIMIT_CHAT[1])
+    check_rate_limit(request, "chat", *RATE_LIMIT_CHAT)
 
     if not OPENROUTER_API_KEY:
         raise HTTPException(status_code=500, detail="OPENROUTER_API_KEY is not set")
 
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
+    body = await _read_json_object(request)
     messages = sanitize(body.get("messages"))
     if not validate_last_user(messages):
         raise HTTPException(status_code=400, detail="Last message must be from the user")
 
     query = messages[-1]["content"]
-    retrieved_chunks = search(query)
+    try:
+        retrieved_chunks = await asyncio.to_thread(search, query)
+    except Exception:
+        logger.exception("Retrieval failed")
+        raise HTTPException(status_code=503, detail="Knowledge retrieval is temporarily unavailable")
+
     system_prompt = build_system_prompt(retrieved_chunks)
-
-    api_messages: list[dict] = [{"role": "system", "content": system_prompt}]
-    for m in messages:
-        api_messages.append({"role": m["role"], "content": m["content"]})
-
-    logger.info(
-        f"Chat: query='{query[:80]}...', chunks={len(retrieved_chunks)}, "
-        f"history={len(messages)}"
-    )
+    api_messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    api_messages.extend({"role": m["role"], "content": m["content"]} for m in messages)
+    logger.info("Chat: chunks=%s, history_messages=%s", len(retrieved_chunks), len(messages))
 
     return StreamingResponse(
         _stream_chat(api_messages, request),
@@ -204,150 +230,133 @@ async def chat(request: Request):
             "Cache-Control": "no-store",
             "X-Content-Type-Options": "nosniff",
             "X-Accel-Buffering": "no",
+            "X-RAG-Sources": _source_header(retrieved_chunks),
         },
     )
 
 
 async def _stream_chat(
-    messages: list[dict],
+    messages: list[dict[str, str]],
     request: Request,
 ) -> AsyncGenerator[str, None]:
-    """Stream LLM response with model fallback, concurrency limit, and output sanitization."""
-    # 并发控制：获取信号量，超时 120 秒自动释放
+    """Run model fallback while closing the HTTP client on completion or disconnect."""
     try:
-        acquired = await asyncio.wait_for(_llm_semaphore.acquire(), timeout=120)
+        await asyncio.wait_for(_llm_semaphore.acquire(), timeout=120)
     except asyncio.TimeoutError:
         yield "\n\n[The server is busy right now. Please try again in a moment.]"
         return
 
     try:
-        client = get_openrouter_client()
-        model_list = models()
-        last_error: Exception | None = None
-        produced = False
+        async with get_openrouter_client() as client:
+            produced = False
+            last_error: Exception | None = None
 
-        async def try_model(model: str) -> AsyncGenerator[str, None]:
-            nonlocal produced
-            async with client.stream(
-                "POST",
-                "/chat/completions",
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "temperature": TEMPERATURE,
-                    "max_tokens": MAX_TOKENS,
-                    "stream": True,
-                },
-            ) as response:
-                if response.status_code != 200:
-                    body = await response.aread()
-                    raise _http_error(response.status_code, body.decode())
-
-                async for line in response.aiter_lines():
-                    if not line.startswith("data: "):
-                        continue
-                    data = line[6:]
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        delta = chunk.get("choices", [{}])[0].get("delta", {})
-                        content = delta.get("content", "")
-                        if content:
-                            produced = True
-                            yield sanitize_output(content)
-                    except (json.JSONDecodeError, KeyError, IndexError):
-                        continue
-
-        for model in model_list:
-            try:
-                async for token in try_model(model):
-                    yield token
-                if produced:
+            for model in models():
+                if await request.is_disconnected():
                     return
-            except Exception as e:
-                last_error = e
-                if produced:
-                    yield friendly_error(e)
-                    return
-                logger.warning(f"Model {model} failed (no output): {e}")
+                try:
+                    async with client.stream(
+                        "POST",
+                        "/chat/completions",
+                        json={
+                            "model": model,
+                            "messages": messages,
+                            "temperature": TEMPERATURE,
+                            "max_tokens": MAX_TOKENS,
+                            "stream": True,
+                        },
+                    ) as response:
+                        if response.status_code != 200:
+                            error_body = (await response.aread()).decode(errors="replace")
+                            raise _http_error(response.status_code, error_body)
 
-        if last_error:
-            yield friendly_error(last_error)
-        else:
-            yield "\n\n[No models available. Try again later.]"
+                        async for line in response.aiter_lines():
+                            if await request.is_disconnected():
+                                return
+                            if not line.startswith("data: "):
+                                continue
+                            data = line[6:]
+                            if data == "[DONE]":
+                                break
+                            try:
+                                chunk = json.loads(data)
+                                content = (
+                                    chunk.get("choices", [{}])[0]
+                                    .get("delta", {})
+                                    .get("content", "")
+                                )
+                            except (json.JSONDecodeError, AttributeError, IndexError):
+                                continue
+                            if isinstance(content, str) and content:
+                                produced = True
+                                yield content
+                    if produced:
+                        return
+                except Exception as error:
+                    last_error = error
+                    if produced:
+                        yield friendly_error(error)
+                        return
+                    logger.warning("Model %s failed before output: %s", model, error)
+
+            if last_error:
+                yield friendly_error(last_error)
+            else:
+                yield "\n\n[No models available. Try again later.]"
     finally:
         _llm_semaphore.release()
 
 
 def _http_error(status: int, body: str) -> Exception:
-    err = Exception(body)
-    err.status_code = status  # type: ignore[attr-defined]
-    return err
-
-
-# ── 追问建议 ─────────────────────────────────────────
+    error = Exception(body)
+    error.status_code = status  # type: ignore[attr-defined]
+    return error
 
 
 @app.post("/api/suggest")
 async def suggest(request: Request):
-    """
-    Follow-up question suggestions.
-
-    Request: { messages: [...], sessionId?: string }
-    Response: { suggestions: string[] }
-    """
+    """Generate short follow-up questions without retaining user history."""
     if not is_allowed_origin(request):
         raise HTTPException(status_code=403, detail="Forbidden")
-
-    check_rate_limit(request, "suggest", RATE_LIMIT_SUGGEST[0], RATE_LIMIT_SUGGEST[1])
-
+    check_rate_limit(request, "suggest", *RATE_LIMIT_SUGGEST)
     if not OPENROUTER_API_KEY:
         return {"suggestions": []}
 
-    try:
-        body = await request.json()
-    except Exception:
-        return {"suggestions": []}
-
-    messages = sanitize(body.get("messages"))
-    if not messages:
+    body = await _read_json_object(request)
+    messages: list[ChatMessage] = sanitize(body.get("messages"))
+    if not messages or await request.is_disconnected():
         return {"suggestions": []}
 
     prompt = build_suggest_prompt(messages)
-    model_list = models()
-
     async with _llm_semaphore:
-        client = get_openrouter_client()
-        for model in model_list:
-            try:
-                response = await client.post(
-                    "/chat/completions",
-                    json={
-                        "model": model,
-                        "messages": [
-                            {"role": "system", "content": SUGGEST_SYSTEM},
-                            {"role": "user", "content": prompt},
-                        ],
-                        "temperature": SUGGEST_TEMPERATURE,
-                        "max_tokens": SUGGEST_MAX_TOKENS,
-                    },
-                )
-                if response.status_code == 200:
+        async with get_openrouter_client() as client:
+            for model in models():
+                try:
+                    response = await client.post(
+                        "/chat/completions",
+                        json={
+                            "model": model,
+                            "messages": [
+                                {"role": "system", "content": SUGGEST_SYSTEM},
+                                {"role": "user", "content": prompt},
+                            ],
+                            "temperature": SUGGEST_TEMPERATURE,
+                            "max_tokens": SUGGEST_MAX_TOKENS,
+                        },
+                    )
+                    if response.status_code != 200:
+                        continue
                     data = response.json()
-                    text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                    suggestions = parse_suggestions(text)
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    suggestions = parse_suggestions(content)
                     if suggestions:
                         return {"suggestions": suggestions}
-            except Exception:
-                continue
-
+                except Exception:
+                    continue
     return {"suggestions": []}
-
-
-# ── 启动入口 ─────────────────────────────────────────
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=PORT)

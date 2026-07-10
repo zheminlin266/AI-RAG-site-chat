@@ -3,6 +3,9 @@
   "version": "1.0.0",
   "description": "RAG-powered AI chat widget for any static website — plug in your docs, write your persona, add your API key.",
   "license": "MIT",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
   "keywords": [
     "rag",
     "ai-chat",

@@ -1,21 +1,22 @@
-"""
-Chat utility functions — Origin validation, message sanitization, HTTP client,
-rate limiting, and output safety.
-"""
+"""Chat request validation, origin checks, rate limiting, and API helpers."""
 from __future__ import annotations
 
-import re
+import ipaddress
 import time
 from collections import defaultdict
 from typing import TypedDict
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 import httpx
 from fastapi import HTTPException, Request
 
-from backend.config import MAX_HISTORY, MAX_CHARS, CORS_ORIGIN, OPENROUTER_API_KEY
-
-# ── 类型 ────────────────────────────────────────────
+from backend.config import (
+    CORS_ORIGINS,
+    MAX_CHARS,
+    MAX_HISTORY,
+    OPENROUTER_API_KEY,
+    TRUSTED_PROXY_IPS,
+)
 
 
 class ChatMessage(TypedDict):
@@ -23,59 +24,100 @@ class ChatMessage(TypedDict):
     content: str
 
 
-# ── Origin 校验 ─────────────────────────────────────
-
-
-def is_allowed_origin(request: Request) -> bool:
-    """
-    Lightweight abuse protection: only serve same-origin browser requests.
-    Accepts matching hosts, localhost, and configured CORS origins.
-    """
-    origin = request.headers.get("origin")
-    if not origin:
-        return False
-
+def _normalise_origin(value: str, *, allow_trailing_slash: bool = False) -> str | None:
+    """Return a canonical web origin, or ``None`` for a malformed value."""
     try:
-        origin_host = urlparse(origin).hostname
-    except Exception:
-        return False
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return None
 
-    if origin_host is None:
-        return False
+    allowed_paths = {"", "/"} if allow_trailing_slash else {""}
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username
+        or parsed.password
+        or parsed.path not in allowed_paths
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
 
-    if origin_host in ("localhost", "127.0.0.1", "::1"):
-        return True
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    default_port = 443 if parsed.scheme == "https" else 80
+    port_suffix = f":{port}" if port is not None and port != default_port else ""
+    return f"{parsed.scheme}://{host}{port_suffix}"
 
+
+def _request_origin(request: Request) -> str | None:
     host = request.headers.get("host", "")
-    allowed = {host}
-    if CORS_ORIGIN and CORS_ORIGIN != "*":
-        for u in CORS_ORIGIN.split(","):
-            try:
-                h = urlparse(u.strip()).hostname
-                if h:
-                    allowed.add(h)
-            except Exception:
-                pass
+    if not host:
+        return None
+    scheme = request.url.scheme
+    # A TLS-terminating reverse proxy forwards HTTP to Uvicorn. Trust its
+    # forwarded scheme only when its direct peer was explicitly configured;
+    # otherwise an arbitrary client could turn http into https here.
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    peer = request.client.host if request.client else ""
+    if forwarded and _is_trusted_proxy(peer):
+        candidate = forwarded.rsplit(",", 1)[-1].strip().lower()
+        if candidate in {"http", "https"}:
+            scheme = candidate
+    return _normalise_origin(f"{scheme}://{host}")
 
-    return origin_host in allowed
+
+def is_allowed_origin(request: Request, *, require_origin: bool = True) -> bool:
+    """Allow only the exact request origin or an explicitly configured origin.
+
+    ``Origin`` is a tuple of scheme, host, and port. Comparing hostname alone
+    accidentally grants access across HTTP/HTTPS or development ports, so both
+    configured CORS origins and the request Host header are canonicalised first.
+    """
+    raw_origin = request.headers.get("origin")
+    if not raw_origin:
+        return not require_origin
+
+    origin = _normalise_origin(raw_origin)
+    if origin is None:
+        return False
+
+    return origin == _request_origin(request) or origin in CORS_ORIGINS
+
+
+def _is_trusted_proxy(peer: str) -> bool:
+    if not TRUSTED_PROXY_IPS:
+        return False
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return any(
+        address in ipaddress.ip_network(value, strict=False)
+        for value in TRUSTED_PROXY_IPS
+    )
 
 
 def client_ip(request: Request) -> str:
-    """Extract client IP, respecting X-Forwarded-For behind reverse proxy."""
-    forwarded = request.headers.get("x-forwarded-for")
-    if forwarded:
-        return forwarded.split(",")[0].strip()
-    host = request.client.host if request.client else "unknown"
-    return host
+    """Return the peer IP, trusting X-Forwarded-For only from configured proxies."""
+    peer = request.client.host if request.client else "unknown"
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded and _is_trusted_proxy(peer):
+        # A trusted proxy appends its observed client address. Walk from the
+        # right so an attacker-controlled leftmost value cannot bypass limits.
+        for candidate in reversed(forwarded.split(",")):
+            candidate = candidate.strip()
+            try:
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                continue
+    return peer
 
 
-# ═══════════════════════════════════════════════════════
-# 频率限制（滑动窗口，进程内内存存储）
-#
-# ponytail: 单进程内存计数，重启后丢失。对个人站点足够。
-# 多进程部署需改用 Redis 或共享存储。
-# ═══════════════════════════════════════════════════════
-
+# ponytail: This is process-local rate limiting. It is sufficient for one
+# instance; use a shared store such as Redis when the service is scaled out.
 _rate_store: dict[str, dict[str, list[float]]] = defaultdict(
     lambda: defaultdict(list)
 )
@@ -87,112 +129,83 @@ def check_rate_limit(
     max_req: int = 20,
     window_sec: int = 60,
 ) -> None:
-    """
-    Sliding-window rate limit per client IP.
-    Raises HTTPException(429) if limit exceeded.
-
-    bucket: logical grouping (e.g. "chat", "suggest", "rebuild")
-    max_req: max requests in the window
-    window_sec: window size in seconds
-    """
+    """Apply a small sliding-window rate limit to the caller's IP address."""
     ip = client_ip(request)
-    now = time.time()
+    now = time.monotonic()
     cutoff = now - window_sec
+    bucket_store = _rate_store[bucket]
 
-    entries = _rate_store[bucket][ip]
-    entries[:] = [t for t in entries if t > cutoff]
+    # Remove expired entries for other clients too, so spoofed or one-off IPs
+    # cannot make this in-memory limiter grow without bound.
+    for stored_ip, timestamps in list(bucket_store.items()):
+        timestamps[:] = [timestamp for timestamp in timestamps if timestamp > cutoff]
+        if not timestamps:
+            del bucket_store[stored_ip]
 
+    entries = bucket_store[ip]
     if len(entries) >= max_req:
         raise HTTPException(
             status_code=429,
             detail="Too many requests. Please wait before trying again.",
         )
-
     entries.append(now)
 
 
-# ═══════════════════════════════════════════════════════
-# 输出安全：防 HTML/URL 注入
-#
-# 前端用 whitespace-pre-wrap 渲染纯文本，HTML 标签不会被浏览器解析。
-# 但 <img src=...> 会触发外部请求（tracking pixel），所以服务端也做一层清理。
-# ═══════════════════════════════════════════════════════
-
-_HTML_TAG_RE = re.compile(r"<[^>]*>")
-_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
-
-
-def sanitize_output(text: str) -> str:
-    """Strip HTML tags and replace URLs with placeholder."""
-    text = _HTML_TAG_RE.sub("", text)
-    text = _URL_RE.sub("[link removed]", text)
-    return text
-
-
-# ── 消息净化 ────────────────────────────────────────
-
-
 def sanitize(raw: object) -> list[ChatMessage]:
-    """Validate and clean message array: filter, truncate, cap history."""
+    """Validate, truncate, and cap a user-supplied chat history."""
     if not isinstance(raw, list):
         return []
 
     cleaned: list[ChatMessage] = []
-    for m in raw:
-        if not isinstance(m, dict):
+    for message in raw:
+        if not isinstance(message, dict):
             continue
-        role = m.get("role")
-        content = m.get("content")
-        if role not in ("user", "assistant"):
+        role = message.get("role")
+        content = message.get("content")
+        if role not in {"user", "assistant"}:
             continue
         if not isinstance(content, str) or not content.strip():
             continue
-        cleaned.append(ChatMessage(role=str(role), content=content[:MAX_CHARS]))
+        cleaned.append({"role": role, "content": content[:MAX_CHARS]})
 
-    return cleaned[-MAX_HISTORY:]
+    bounded = cleaned[-MAX_HISTORY:]
+    # Keep complete turns: after a 40-message slice, the oldest item can be
+    # the assistant half of a discarded turn. Drop it rather than sending an
+    # orphan reply as context for the next user question.
+    if bounded and bounded[0]["role"] == "assistant":
+        bounded = bounded[1:]
+    return bounded
 
 
 def validate_last_user(messages: list[ChatMessage]) -> bool:
-    return len(messages) > 0 and messages[-1]["role"] == "user"
-
-
-# ── OpenRouter 客户端 ────────────────────────────────
+    return bool(messages) and messages[-1]["role"] == "user"
 
 
 def get_openrouter_client() -> httpx.AsyncClient:
+    """Create a short-lived client; callers must use it as an async context manager."""
+    referer = CORS_ORIGINS[0] if CORS_ORIGINS else "http://localhost:8000"
     return httpx.AsyncClient(
         base_url="https://openrouter.ai/api/v1",
         headers={
             "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-            "HTTP-Referer": CORS_ORIGIN if CORS_ORIGIN != "*" else "http://localhost:8000",
+            "HTTP-Referer": referer,
             "X-Title": "RAG Site Chat",
         },
         timeout=60.0,
     )
 
 
-# ── 错误处理 ────────────────────────────────────────
-
-
 def friendly_error(err: Exception) -> str:
-    """Convert API errors to user-friendly messages."""
-    msg = str(err).lower()
+    """Convert upstream API errors to a safe, user-facing streaming message."""
+    message = str(err).lower()
     status = getattr(err, "status_code", None) or getattr(err, "status", None)
 
-    if status == 429 or ("rate" in msg and "limit" in msg):
+    if status == 429 or ("rate" in message and "limit" in message):
         return "\n\n[I'm getting a lot of questions — give it a moment and try again.]"
-    if status == 402 or any(w in msg for w in ("credit", "quota", "insufficient", "payment")):
+    if status == 402 or any(
+        word in message for word in ("credit", "quota", "insufficient", "payment")
+    ):
         return "\n\n[The chat is out of credit at the moment. Try again later.]"
-    if status == 404 or any(w in msg for w in ("not found", "no endpoints")):
+    if status == 404 or any(word in message for word in ("not found", "no endpoints")):
         return "\n\n[That model isn't available right now. Try again shortly.]"
-
     return "\n\n[Sorry — something went wrong. Try again in a moment.]"
-
-
-# ── Session ID ──────────────────────────────────────
-
-
-def session_id_of(raw: object) -> str | None:
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()[:200]
-    return None

@@ -39,6 +39,5 @@ Dockerfile
 .dockerignore
 docker-compose*.yml
 
-# ── Misc ──
-*.md
-LICENSE
+# Keep PERSONA.md and Markdown knowledge-base files in the published image.
+# This also makes the image useful without a Docker Compose bind mount.

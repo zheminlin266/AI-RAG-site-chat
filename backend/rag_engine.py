@@ -15,10 +15,16 @@ Retrieval strategy:
 """
 from __future__ import annotations
 
+from collections import Counter
+from contextlib import contextmanager
 import hashlib
+import json
 import logging
+import os
 from pathlib import Path
-from typing import TypedDict
+import threading
+from typing import Iterator, TypedDict
+from uuid import uuid4
 
 import chromadb
 import httpx
@@ -48,18 +54,106 @@ class Chunk(TypedDict):
 
 _chroma_client: chromadb.PersistentClient | None = None
 _collection: chromadb.Collection | None = None
+_active_collection_name: str | None = None
+
+# Rebuilds populate a complete staging collection before switching this pointer.
+# Existing searches retain a read lease on the old collection until they finish.
+_state_lock = threading.RLock()
+_build_lock = threading.Lock()
+_active_readers: Counter[str] = Counter()
+_retired_collections: set[str] = set()
+_DEFAULT_COLLECTION = "knowledge"
+_STAGING_PREFIX = "knowledge-staging-"
+
+
+def _active_index_file() -> Path:
+    return _cfg.CHROMA_DB_DIR / "active_index.json"
+
+
+def _valid_collection_name(name: object) -> bool:
+    return isinstance(name, str) and (
+        name == _DEFAULT_COLLECTION
+        or (
+            name.startswith(_STAGING_PREFIX)
+            and len(name) == len(_STAGING_PREFIX) + 32
+            and all(char in "0123456789abcdef" for char in name[len(_STAGING_PREFIX) :])
+        )
+    )
+
+
+def _read_active_collection_name() -> str:
+    try:
+        payload = json.loads(_active_index_file().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _DEFAULT_COLLECTION
+    except (OSError, json.JSONDecodeError) as error:
+        logger.warning("Ignoring invalid active index pointer: %s", error)
+        return _DEFAULT_COLLECTION
+
+    name = payload.get("collection") if isinstance(payload, dict) else None
+    if _valid_collection_name(name):
+        return name
+    logger.warning("Ignoring invalid active index collection name: %r", name)
+    return _DEFAULT_COLLECTION
+
+
+def _write_active_collection_name(name: str) -> None:
+    if not _valid_collection_name(name):
+        raise RuntimeError("Refusing to persist an invalid collection name")
+    index_file = _active_index_file()
+    index_file.parent.mkdir(parents=True, exist_ok=True)
+    temporary = index_file.with_name(f".{index_file.name}.{uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps({"collection": name}), encoding="utf-8")
+        os.replace(temporary, index_file)
+    finally:
+        if temporary.exists():
+            temporary.unlink(missing_ok=True)
+
+
+def _get_chroma_client() -> chromadb.PersistentClient:
+    global _chroma_client
+    if _chroma_client is None:
+        _chroma_client = chromadb.PersistentClient(path=str(_cfg.CHROMA_DB_DIR))
+    return _chroma_client
+
+
+def _open_active_collection_locked() -> chromadb.Collection:
+    global _collection, _active_collection_name
+    if _collection is not None:
+        return _collection
+
+    client = _get_chroma_client()
+    name = _active_collection_name or _read_active_collection_name()
+    try:
+        if name == _DEFAULT_COLLECTION:
+            collection = client.get_or_create_collection(
+                name=name, metadata={"hnsw:space": "cosine"}
+            )
+        else:
+            collection = client.get_collection(name=name)
+    except Exception as error:
+        if name == _DEFAULT_COLLECTION:
+            raise
+        logger.warning(
+            "Active collection %s could not be opened (%s); falling back to %s",
+            name,
+            error,
+            _DEFAULT_COLLECTION,
+        )
+        name = _DEFAULT_COLLECTION
+        collection = client.get_or_create_collection(
+            name=name, metadata={"hnsw:space": "cosine"}
+        )
+
+    _collection = collection
+    _active_collection_name = name
+    return collection
 
 
 def _get_collection() -> chromadb.Collection:
-    global _chroma_client, _collection
-    if _chroma_client is None:
-        _chroma_client = chromadb.PersistentClient(path=str(_cfg.CHROMA_DB_DIR))
-    if _collection is None:
-        _collection = _chroma_client.get_or_create_collection(
-            name="knowledge",
-            metadata={"hnsw:space": "cosine"},
-        )
-    return _collection
+    with _state_lock:
+        return _open_active_collection_locked()
 
 
 # ── BM25 索引（单例） ───────────────────────────────
@@ -69,6 +163,49 @@ def _get_collection() -> chromadb.Collection:
 _bm25_index: BM25Okapi | None = None
 _bm25_chunk_ids: list[str] = []  # 与 BM25 索引排序一致的 chunk ID 列表
 _all_chunks: dict[str, Chunk] = {}  # chunk_id → Chunk 全量映射（用于 BM25 命中回查）
+
+
+@contextmanager
+def _active_state() -> Iterator[
+    tuple[chromadb.Collection, str, BM25Okapi | None, list[str], dict[str, Chunk]]
+]:
+    """Take a read lease so a completed search never loses its collection."""
+    with _state_lock:
+        collection = _open_active_collection_locked()
+        name = _active_collection_name
+        if name is None:  # Defensive: _open_active_collection_locked sets this.
+            raise RuntimeError("No active Chroma collection")
+        _active_readers[name] += 1
+        bm25 = _bm25_index
+        bm25_ids = _bm25_chunk_ids[:]
+        chunks = _all_chunks.copy()
+
+    try:
+        yield collection, name, bm25, bm25_ids, chunks
+    finally:
+        _release_collection_lease(name)
+
+
+def _release_collection_lease(name: str) -> None:
+    delete_name: str | None = None
+    with _state_lock:
+        _active_readers[name] -= 1
+        if _active_readers[name] <= 0:
+            _active_readers.pop(name, None)
+            if name in _retired_collections:
+                _retired_collections.remove(name)
+                delete_name = name
+    if delete_name:
+        _delete_collection(delete_name)
+
+
+def _delete_collection(name: str) -> None:
+    try:
+        _get_chroma_client().delete_collection(name=name)
+        logger.info("Deleted retired Chroma collection: %s", name)
+    except Exception as error:
+        # A failed cleanup is safe: the active pointer still names the new index.
+        logger.warning("Could not delete retired collection %s: %s", name, error)
 
 
 def _tokenize(text: str) -> list[str]:
@@ -104,14 +241,6 @@ def _tokenize(text: str) -> list[str]:
                     tokens.append(cleaned)
 
     return [t for t in tokens if t.strip()]
-
-
-def _get_bm25() -> BM25Okapi | None:
-    return _bm25_index
-
-
-def _get_bm25_chunk_ids() -> list[str]:
-    return _bm25_chunk_ids
 
 
 # ── 嵌入：通过 OpenRouter API ────────────────────────
@@ -355,206 +484,247 @@ def _rrf_fusion(
 # ── 公共 API ────────────────────────────────────────
 
 
-def _rebuild_bm25_from_collection(collection: chromadb.Collection) -> None:
-    """
-    Rebuild BM25 index from existing ChromaDB collection.
-    Called when index exists but BM25 is not built (restart after upgrade).
-    """
-    global _bm25_index, _bm25_chunk_ids, _all_chunks
+def _bm25_state(
+    ids: list[str], docs: list[str], metas: list[dict[str, str]]
+) -> tuple[BM25Okapi, list[str], dict[str, Chunk]]:
+    if not ids:
+        raise RuntimeError("Cannot build a BM25 index without chunks")
+    return (
+        BM25Okapi([_tokenize(document) for document in docs]),
+        ids[:],
+        {
+            chunk_id: Chunk(id=chunk_id, text=document, metadata=metadata)
+            for chunk_id, document, metadata in zip(ids, docs, metas)
+        },
+    )
 
-    existing = collection.count()
-    if existing == 0:
-        return
 
-    # Fetch all chunks from ChromaDB in batches
-    # ponytail: ChromaDB get() with no filter returns all — fine for <50K chunks
+def _bm25_state_from_collection(
+    collection: chromadb.Collection,
+) -> tuple[BM25Okapi, list[str], dict[str, Chunk]]:
     all_data = collection.get(include=["documents", "metadatas"])
-    if not all_data["ids"]:
-        return
+    ids = list(all_data.get("ids") or [])
+    if not ids:
+        raise RuntimeError("Cannot build BM25 from an empty collection")
 
-    ids = all_data["ids"]
-    docs = all_data["documents"] or [""] * len(ids)
-    metas = all_data["metadatas"] or [{}] * len(ids)
+    raw_docs = all_data.get("documents") or [""] * len(ids)
+    raw_metas = all_data.get("metadatas") or [{}] * len(ids)
+    docs = [document if isinstance(document, str) else "" for document in raw_docs]
+    metas = [metadata if isinstance(metadata, dict) else {} for metadata in raw_metas]
+    return _bm25_state(ids, docs, metas)
 
-    tokenized = [_tokenize(d) for d in docs]
-    _bm25_index = BM25Okapi(tokenized)
-    _bm25_chunk_ids = list(ids)
-    _all_chunks = {
-        cid: Chunk(id=cid, text=t, metadata=m)
-        for cid, t, m in zip(ids, docs, metas)
-    }
-    logger.info(f"BM25 index rebuilt from {len(ids)} existing chunks")
+
+def _set_bm25_state_if_active(
+    collection_name: str,
+    bm25: BM25Okapi,
+    ids: list[str],
+    chunks: dict[str, Chunk],
+) -> None:
+    global _bm25_index, _bm25_chunk_ids, _all_chunks
+    with _state_lock:
+        if _active_collection_name == collection_name:
+            _bm25_index = bm25
+            _bm25_chunk_ids = ids
+            _all_chunks = chunks
+
+
+def _activate_staging_collection(
+    collection: chromadb.Collection,
+    name: str,
+    bm25: BM25Okapi,
+    bm25_ids: list[str],
+    chunks: dict[str, Chunk],
+) -> None:
+    """Persist the new pointer before exposing the new index to readers."""
+    global _collection, _active_collection_name, _bm25_index, _bm25_chunk_ids, _all_chunks
+
+    _write_active_collection_name(name)
+    delete_name: str | None = None
+    with _state_lock:
+        old_name = _active_collection_name
+        _collection = collection
+        _active_collection_name = name
+        _bm25_index = bm25
+        _bm25_chunk_ids = bm25_ids
+        _all_chunks = chunks
+
+        if old_name and old_name != name:
+            if _active_readers.get(old_name, 0):
+                _retired_collections.add(old_name)
+            else:
+                delete_name = old_name
+
+    if delete_name:
+        _delete_collection(delete_name)
+
+
+def _deduplicated_chunks(files: list[dict]) -> tuple[list[str], list[str], list[dict[str, str]]]:
+    seen: set[str] = set()
+    ids: list[str] = []
+    texts: list[str] = []
+    metas: list[dict[str, str]] = []
+
+    for file_data in files:
+        for chunk in _split_into_chunks(file_data["content"], file_data["path"]):
+            if chunk["id"] in seen:
+                continue
+            seen.add(chunk["id"])
+            ids.append(chunk["id"])
+            texts.append(chunk["text"])
+            metas.append(chunk["metadata"])
+    return ids, texts, metas
 
 
 def build_index(force: bool = False) -> int:
-    """
-    Load all documents, chunk, embed via OpenRouter API, store in ChromaDB.
-    Returns total chunk count.
-    """
-    global _chroma_client, _collection, _bm25_index, _bm25_chunk_ids, _all_chunks
+    """Build a complete staged index and switch to it only after success."""
+    with _build_lock:
+        with _active_state() as (active_collection, active_name, current_bm25, _, _):
+            existing = active_collection.count()
 
-    collection = _get_collection()
-    existing = collection.count()
-    if existing > 0 and not force:
-        # Ensure BM25 is built even if index already exists (restart / upgrade path)
-        if _bm25_index is None:
-            logger.info(f"Index has {existing} chunks, building BM25 index...")
-            _rebuild_bm25_from_collection(collection)
-        else:
-            logger.info(f"Index has {existing} chunks, skipping rebuild")
-        return existing
+        if existing and not force:
+            if current_bm25 is None:
+                logger.info("Index has %s chunks; rebuilding its BM25 index...", existing)
+                bm25, bm25_ids, chunks = _bm25_state_from_collection(active_collection)
+                _set_bm25_state_if_active(active_name, bm25, bm25_ids, chunks)
+            else:
+                logger.info("Index has %s chunks; skipping rebuild", existing)
+            return existing
 
-    if existing > 0:
-        logger.info(f"Rebuilding: clearing {existing} existing chunks...")
-        _chroma_client.delete_collection("knowledge")
-        _collection = None
-        _collection = _chroma_client.get_or_create_collection(
-            name="knowledge",
-            metadata={"hnsw:space": "cosine"},
+        files = _load_all_documents(_cfg.KNOWLEDGE_BASE_DIR)
+        if not files:
+            message = f"No documents found in {_cfg.KNOWLEDGE_BASE_DIR}"
+            if existing:
+                raise RuntimeError(f"{message}; the existing index was kept")
+            logger.warning(message)
+            return 0
+
+        ids, texts, metas = _deduplicated_chunks(files)
+        if not ids:
+            message = "No indexable document chunks were produced"
+            if existing:
+                raise RuntimeError(f"{message}; the existing index was kept")
+            logger.warning(message)
+            return 0
+
+        logger.info("Generating embeddings for %s chunks via OpenRouter...", len(texts))
+        embeddings = _embed_in_batches(texts, batch_size=50)
+        if len(embeddings) != len(texts):
+            raise RuntimeError(
+                f"Embedding API returned {len(embeddings)} vectors for {len(texts)} chunks"
+            )
+        bm25, bm25_ids, chunks = _bm25_state(ids, texts, metas)
+
+        staging_name = f"{_STAGING_PREFIX}{uuid4().hex}"
+        staging = _get_chroma_client().create_collection(
+            name=staging_name, metadata={"hnsw:space": "cosine"}
         )
-        collection = _collection
+        try:
+            staging.add(
+                ids=ids,
+                embeddings=embeddings,  # type: ignore[arg-type]
+                documents=texts,
+                metadatas=metas,  # type: ignore[arg-type]
+            )
+            _activate_staging_collection(staging, staging_name, bm25, bm25_ids, chunks)
+        except Exception:
+            # The active collection remains untouched until _activate succeeds.
+            _delete_collection(staging_name)
+            raise
 
-    files = _load_all_documents(_cfg.KNOWLEDGE_BASE_DIR)
-    if not files:
-        logger.warning(f"No documents found in {_cfg.KNOWLEDGE_BASE_DIR}")
-        return 0
+        logger.info("Index built and activated: %s chunks", len(ids))
+        return len(ids)
 
-    all_chunks: list[Chunk] = []
-    for f in files:
-        chunks = _split_into_chunks(f["content"], f["path"])
-        all_chunks.extend(chunks)
 
-    logger.info(f"Created {len(all_chunks)} chunks from {len(files)} files")
-    if not all_chunks:
-        return 0
+def _positive_bm25_results(
+    bm25: BM25Okapi | None,
+    chunk_ids: list[str],
+    query_tokens: list[str],
+    candidate_k: int,
+) -> list[tuple[str, float]]:
+    """Rank only actual keyword matches; zero-score rows are not candidates."""
+    if bm25 is None or not chunk_ids or not query_tokens:
+        return []
 
-    texts = [c["text"] for c in all_chunks]
-    ids = [c["id"] for c in all_chunks]
-    metadatas = [c["metadata"] for c in all_chunks]
-
-    # 去重：相同内容的 chunk 只保留一份
-    seen: set[str] = set()
-    dedup_ids, dedup_texts, dedup_metas = [], [], []
-    for cid, ct, cm in zip(ids, texts, metadatas):
-        if cid not in seen:
-            seen.add(cid)
-            dedup_ids.append(cid)
-            dedup_texts.append(ct)
-            dedup_metas.append(cm)
-
-    dup_count = len(texts) - len(dedup_ids)
-    if dup_count:
-        logger.info(f"Removed {dup_count} duplicate chunks")
-
-    logger.info(f"Generating embeddings for {len(dedup_texts)} chunks via OpenRouter...")
-    embeddings = _embed_in_batches(dedup_texts, batch_size=50)
-
-    collection.add(
-        ids=dedup_ids,
-        embeddings=embeddings,  # type: ignore[arg-type]
-        documents=dedup_texts,
-        metadatas=dedup_metas,  # type: ignore[arg-type]
-    )
-
-    logger.info(f"Index built: {len(dedup_ids)} chunks")
-
-    # ── 同步构建 BM25 索引 ──
-    tokenized = [_tokenize(t) for t in dedup_texts]
-    _bm25_index = BM25Okapi(tokenized)
-    _bm25_chunk_ids = dedup_ids[:]
-    _all_chunks = {cid: Chunk(id=cid, text=t, metadata=m)
-                   for cid, t, m in zip(dedup_ids, dedup_texts, dedup_metas)}
-    logger.info(f"BM25 index built: {len(dedup_ids)} documents")
-
-    return len(dedup_ids)
+    scores = bm25.get_scores(query_tokens)
+    scored = [
+        (chunk_ids[index], float(score))
+        for index, score in enumerate(scores[: len(chunk_ids)])
+        if float(score) > 0.0
+    ]
+    scored.sort(key=lambda pair: pair[1], reverse=True)
+    return scored[:candidate_k]
 
 
 def search(query: str, k: int = _cfg.RETRIEVAL_K) -> list[Chunk]:
-    """
-    Hybrid retrieval: vector (semantic) + BM25 (keyword) → RRF fusion.
-
-    1. Vector search → K candidates with cosine distances
-    2. BM25 keyword search → K candidates
-    3. Distance threshold: drop vector results with distance > MIN_SIMILARITY
-    4. RRF merge both ranked lists
-    5. Return top-K chunks (or empty list if nothing relevant found)
-    """
-    candidate_k = _cfg.RETRIEVAL_CANDIDATE_K
-    min_sim = _cfg.MIN_SIMILARITY
-
-    # ── Vector search ──
-    collection = _get_collection()
-    if collection.count() == 0:
+    """Retrieve relevant chunks using thresholded vector search and positive BM25."""
+    if not query.strip() or k <= 0:
         return []
 
-    query_embedding = _embed([query])
-    results = collection.query(
-        query_embeddings=query_embedding,  # type: ignore[arg-type]
-        n_results=candidate_k,
-        include=["documents", "metadatas", "distances"],
-    )
+    with _active_state() as (collection, _, bm25, bm25_ids, all_chunks):
+        chunk_count = collection.count()
+        if chunk_count == 0:
+            return []
 
-    if not results["ids"] or not results["ids"][0]:
-        return []
+        candidate_k = min(_cfg.RETRIEVAL_CANDIDATE_K, chunk_count)
+        query_embedding = _embed([query])
+        results = collection.query(
+            query_embeddings=query_embedding,  # type: ignore[arg-type]
+            n_results=candidate_k,
+            include=["documents", "metadatas", "distances"],
+        )
 
-    vector_chunks: dict[str, Chunk] = {}
-    vector_ranked: list[tuple[str, float]] = []  # (chunk_id, distance)
+        id_groups = results.get("ids") or []
+        if not id_groups or not id_groups[0]:
+            return []
 
-    for i, chunk_id in enumerate(results["ids"][0]):
-        dist = results["distances"][0][i] if results["distances"] else 0.0
-        text = results["documents"][0][i] if results["documents"] else ""
-        meta = results["metadatas"][0][i] if results["metadatas"] else {}
+        result_ids = id_groups[0]
+        distance_groups = results.get("distances") or []
+        document_groups = results.get("documents") or []
+        metadata_groups = results.get("metadatas") or []
+        distances = distance_groups[0] if distance_groups else []
+        documents = document_groups[0] if document_groups else []
+        metadatas = metadata_groups[0] if metadata_groups else []
 
-        # Distance threshold: drop irrelevant chunks
-        if dist > min_sim:
-            continue
+        vector_chunks: dict[str, Chunk] = {}
+        vector_ranked: list[tuple[str, float]] = []
+        for index, chunk_id in enumerate(result_ids):
+            if index >= len(distances):
+                continue
+            distance = float(distances[index])
+            if distance > _cfg.MIN_SIMILARITY:
+                continue
 
-        vector_chunks[chunk_id] = Chunk(id=chunk_id, text=text, metadata=meta)
-        # Invert distance for RRF ranking (smaller distance = more relevant = lower rank)
-        vector_ranked.append((chunk_id, dist))
+            text = documents[index] if index < len(documents) else ""
+            metadata = metadatas[index] if index < len(metadatas) else {}
+            vector_chunks[chunk_id] = Chunk(
+                id=chunk_id,
+                text=text if isinstance(text, str) else "",
+                metadata=metadata if isinstance(metadata, dict) else {},
+            )
+            vector_ranked.append((chunk_id, distance))
 
-    # ── BM25 keyword search ──
-    bm25 = _get_bm25()
-    bm25_ids = _get_bm25_chunk_ids()
-    bm25_ranked: list[tuple[str, float]] = []
-
-    if bm25 is not None and bm25_ids:
-        tokenized_query = _tokenize(query)
-        scores = bm25.get_scores(tokenized_query)
-
-        # Build (chunk_id, score) pairs and sort by score descending
-        scored = [(bm25_ids[i], float(scores[i])) for i in range(len(bm25_ids))]
-        scored.sort(key=lambda x: x[1], reverse=True)
-        bm25_ranked = scored[:candidate_k]
-
-    # ── RRF fusion ──
-    fused_ids = _rrf_fusion(vector_ranked, bm25_ranked)
-
-    if not fused_ids:
-        return []
-
-    # ── Collect results, preferring vector chunks for text/metadata ──
-    result_chunks: list[Chunk] = []
-    for cid in fused_ids[:k]:
-        if cid in vector_chunks:
-            result_chunks.append(vector_chunks[cid])
-        elif cid in _all_chunks:
-            result_chunks.append(_all_chunks[cid])
-        else:
-            # Should not happen in normal operation
-            logger.warning(f"Chunk {cid} not found in vector_chunks or _all_chunks")
-
-    return result_chunks
+        bm25_ranked = _positive_bm25_results(
+            bm25, bm25_ids, _tokenize(query), candidate_k
+        )
+        fused_ids = _rrf_fusion(vector_ranked, bm25_ranked)
+        return [
+            vector_chunks[chunk_id]
+            if chunk_id in vector_chunks
+            else all_chunks[chunk_id]
+            for chunk_id in fused_ids[:k]
+            if chunk_id in vector_chunks or chunk_id in all_chunks
+        ]
 
 
-def get_index_stats() -> dict:
-    collection = _get_collection()
-    bm25 = _get_bm25()
+def get_index_stats() -> dict[str, object]:
+    with _active_state() as (collection, name, bm25, _, _):
+        chunk_count = collection.count()
     return {
-        "chunk_count": collection.count(),
+        "chunk_count": chunk_count,
         "knowledge_base_dir": str(_cfg.KNOWLEDGE_BASE_DIR),
-        "has_index": collection.count() > 0,
+        "has_index": chunk_count > 0,
         "has_bm25": bm25 is not None,
+        "active_collection": name,
         "retrieval_k": _cfg.RETRIEVAL_K,
         "candidate_k": _cfg.RETRIEVAL_CANDIDATE_K,
         "min_similarity": _cfg.MIN_SIMILARITY,

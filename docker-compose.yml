@@ -1,7 +1,7 @@
 services:
   rag-chat:
     # Use pre-built image from GitHub Container Registry:
-    # image: ghcr.io/your-org/rag-site-chat:latest
+    # image: ghcr.io/zheminlin266/ai-rag-site-chat:latest
     # Or build from source (default):
     build: .
     restart: unless-stopped
@@ -31,10 +31,8 @@ services:
     healthcheck:
       test:
         [
-          "CMD",
-          "python",
-          "-c",
-          "from urllib.request import urlopen; urlopen('http://localhost:${PORT:-8000}/api/health')",
+          "CMD-SHELL",
+          "python -c \"from urllib.request import urlopen; urlopen('http://localhost:$${PORT:-8000}/api/health')\"",
         ]
       interval: 30s
       timeout: 10s

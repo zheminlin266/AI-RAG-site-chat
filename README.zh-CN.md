@@ -371,7 +371,7 @@ Internet ──▶ Nginx/Caddy (HTTPS) ──▶ Docker 容器 (FastAPI:8000)
 - **VPS**：Ubuntu 22.04+ / Debian 12+，1 核 1G 即可（推荐 2G，首次构建索引时嵌入 API 调用较多）
 - **Docker + Docker Compose**：[官方安装指南](https://docs.docker.com/engine/install/)
 - **域名**（推荐）：用于配置 HTTPS 证书
-- **OpenRouter API Key**：[openrouter.ai](https://openrouter.ai/) 注册即送免费额度
+- **OpenRouter API Key**：[openrouter.ai](https://openrouter.ai/) 
 
 ### 步骤 1：准备项目
 

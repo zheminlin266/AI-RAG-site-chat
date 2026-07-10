@@ -19,6 +19,8 @@
 
 A floating chat button appears on your website. Visitors click it, ask questions, and get answers grounded in **your** content — your blog posts, your docs, your data. The AI only knows what you give it.
 
+![UI Wireframe](UI wireframe.png)
+
 - RAG (Retrieval-Augmented Generation): answers are grounded in your documents, not hallucinated
 - Hybrid search: semantic (vector) + keyword (BM25) → RRF fusion — scales to large knowledge bases
 - Smart filtering: cosine distance threshold drops irrelevant chunks — honest "I don't know" over forced answers
@@ -126,54 +128,54 @@ Or embed as a vanilla script (see [frontend/README.md](./frontend/README.md) for
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────┐
+┌───────────────────────────────────────────────────────────┐
 │                    Your Website                           │
-│  ┌──────────────────────────────────────────────────┐   │
+│  ┌──────────────────────────────────────────────────┐     │
 │  │            ai-chat.tsx (Chat Widget)               │   │
 │  │  · Floating button → chat panel                   │   │
 │  │  · Streaming token rendering                      │   │
 │  │  · Session management                             │   │
 │  │  · Follow-up suggestions                          │   │
-│  └─────────────┬────────────────────────────────────┘   │
+│  └─────────────┬────────────────────────────────────┘     │
 │                │ POST /api/chat                          │
-└────────────────┼────────────────────────────────────────┘
+└────────────────┼──────────────────────────────────────────┘
                  │
-┌────────────────▼────────────────────────────────────────┐
+┌────────────────▼──────────────────────────────────────────┐
 │             server.py (FastAPI)                           │
 │                                                           │
-│  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐   │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────────────┐     │
 │  │ Origin   │  │ Sanitize │  │ Stream Response (SSE) │   │
 │  │ Check    │  │ Messages │  │                       │   │
-│  └──────────┘  └──────────┘  └──────────────────────┘   │
+│  └──────────┘  └──────────┘  └──────────────────────┘     │
 │        │              │               │                   │
-│  ┌─────▼──────────────▼───────────────▼──────────────┐   │
+│  ┌─────▼──────────────▼───────────────▼──────────────┐    │
 │  │              Processing Pipeline                    │   │
 │  │  Persona (PERSONA.md) + RAG Context + Guardrails   │   │
-│  └──────────────────────┬────────────────────────────┘   │
+│  └──────────────────────┬────────────────────────────┘    │
 │                         │                                 │
-│  ┌──────────────────────▼────────────────────────────┐   │
+│  ┌──────────────────────▼────────────────────────────┐    │
 │  │            OpenRouter API Call                      │   │
 │  │  Model 1 → fail? → Model 2 → fail? → error        │   │
-│  └───────────────────────────────────────────────────┘   │
+│  └───────────────────────────────────────────────────┘    │
 └───────────────────────────────────────────────────────────┘
                  │
-┌────────────────▼────────────────────────────────────────┐
+┌────────────────▼──────────────────────────────────────────┐
 │              rag_engine.py (RAG Engine)                    │
 │                                                           │
 │  Data sources: Local folder │ GitHub repo │ knowledge-base/ │
-│  ┌─────────────┐   ┌─────────────┐   ┌───────────────┐  │
+│  ┌─────────────┐   ┌─────────────┐   ┌───────────────┐    │
 │  │ Doc Loader  │──▶│ Chunk       │──▶│ OpenRouter    │  │
 │  │ .md .html   │   │ Splitter    │   │ Embed API     │  │
 │  │ .json .txt  │   │ by headings │   │ → ChromaDB    │  │
-│  └─────────────┘   └─────────────┘   └───────┬───────┘  │
+│  └─────────────┘   └─────────────┘   └───────┬───────┘    │
 │                                              │           │
-│           ┌──────────────────────────────────┘           │
+│           ┌──────────────────────────────────┘            │
 │           │                                              │
 │           ▼                                              │
-│    ┌──────────────┐     ┌──────────────┐                 │
+│    ┌──────────────┐     ┌──────────────┐                  │
 │    │ Vector search│     │ BM25 keyword │                 │
 │    │ (semantic)   │     │ (exact match)│                 │
-│    └──────┬───────┘     └──────┬───────┘                 │
+│    └──────┬───────┘     └──────┬───────┘                  │
 │           │                    │                          │
 │           └────────┬───────────┘                          │
 │                    ▼                                      │
@@ -183,7 +185,7 @@ Or embed as a vanilla script (see [frontend/README.md](./frontend/README.md) for
 │            │   threshold  │                               │
 │            │ → Top-20     │                               │
 │            └──────────────┘                               │
-└──────────────────────────────────────────────────────────┘
+└───────────────────────────────────────────────────────────┘
 ```
 
 ### Data flow (per request)

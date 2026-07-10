@@ -1,6 +1,6 @@
 # RAG Site Chat
 
-[中文版](./README.zh-CN.md)
+[中文Readme](./README.zh-CN.md)
 
 **RAG-powered AI chat widget for any static website.** Drop in your documents, write a persona, add your API key — your site visitors can chat with your content in under 5 minutes.
 

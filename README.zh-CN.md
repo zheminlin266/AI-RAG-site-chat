@@ -11,7 +11,7 @@
   <img src="https://img.shields.io/badge/frontend-React_18-61DAFB?logo=react" alt="React">
 </p>
 
-> 英文原版: [README.md](./README.md)
+> English Version: [README.md](./README.md)
 
 ---
 

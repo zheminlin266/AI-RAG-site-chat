@@ -638,4 +638,4 @@ Inspired by [pedromello.cc](https://pedromello.cc)'s "Ask me anything" module. B
 
 ## License
 
-[MIT](./LICENSE) — use it, fork it, ship it.
+[MIT](./LICENSE)

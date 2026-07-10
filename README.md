@@ -95,7 +95,7 @@ cp .env.example .env
 # Edit .env → paste your OpenRouter API key
 ```
 
-Get a key at [openrouter.ai](https://openrouter.ai/) (free credits on signup).
+Get a key at [openrouter.ai](https://openrouter.ai/) .
 
 ### 5. Start the server
 
@@ -374,7 +374,7 @@ Internet ──▶ Nginx/Caddy (HTTPS) ──▶ Docker container (FastAPI:8000)
 - **VPS**: Ubuntu 22.04+ / Debian 12+, 1 vCPU 1 GB RAM minimum (2 GB recommended — the initial index build makes many embedding API calls)
 - **Docker + Docker Compose**: [official install guide](https://docs.docker.com/engine/install/)
 - **Domain name** (recommended): for HTTPS certificates
-- **OpenRouter API Key**: sign up at [openrouter.ai](https://openrouter.ai/) for free credits
+- **OpenRouter API Key**: sign up at [openrouter.ai](https://openrouter.ai/) 
 
 ### Step 1: Get the project
 

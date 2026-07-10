@@ -637,4 +637,4 @@ AI-RAG-site-chat/
 
 ## 许可证
 
-[MIT](./LICENSE)——随便用，随便改，随便发。
+[MIT](./LICENSE)

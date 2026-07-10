@@ -94,7 +94,7 @@ cp .env.example .env
 # 编辑 .env → 粘贴你的 OpenRouter API Key
 ```
 
-在 [openrouter.ai](https://openrouter.ai/) 注册即可获取 Key（注册即送免费额度）。
+在 [openrouter.ai](https://openrouter.ai/) 。
 
 ### 5. 启动服务
 
